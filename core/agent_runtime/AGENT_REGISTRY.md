@@ -86,10 +86,61 @@ An agent must not:
 
 ## Initial Registry
 
-The initial registry is intentionally empty.
+### research_agent
 
-Agents will be added only after their responsibilities, interfaces, tools,
-memory access, and verification requirements have been explicitly designed.
+- id: research_agent
+- name: Research Agent
+- purpose: Conduct structured research and evidence analysis.
+- capabilities:
+  - research
+  - source_analysis
+  - evidence_synthesis
+  - comparison
+  - contradiction_detection
+  - uncertainty_assessment
+- responsibilities:
+  - investigate research objectives
+  - gather evidence
+  - analyze sources
+  - distinguish facts from inference
+  - produce structured findings
+- inputs:
+  - research objective
+  - questions
+  - constraints
+  - approved sources
+  - relevant context
+- outputs:
+  - research_summary
+  - findings
+  - evidence
+  - source_references
+  - contradictions
+  - assumptions
+  - confidence
+  - knowledge_gaps
+  - recommended_next_actions
+- tools:
+  - approved read-only search
+  - approved document/file reading
+- memory_access:
+  - approved project memory
+  - approved research memory
+- model_requirements:
+  - multi-step reasoning
+  - source analysis
+  - structured synthesis
+- risk_level: LOW
+- verification_requirements:
+  - verify important claims
+  - identify source conflicts
+  - distinguish fact from inference
+  - report uncertainty
+- status: proposed
+
+The registry must only contain agents whose responsibilities, interfaces,
+tools, memory access, and verification requirements have been explicitly
+designed.
 
 ---
 
