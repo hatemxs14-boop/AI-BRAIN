@@ -16,6 +16,14 @@
       "scope": "workspace",
       "risk_level": "HIGH",
       "approval": "policy"
+    },
+    {
+      "subject": "research_agent",
+      "resource": "document",
+      "action": "read",
+      "scope": "workspace",
+      "risk_level": "LOW",
+      "approval": "none"
     }
   ],
   "defaults": {
