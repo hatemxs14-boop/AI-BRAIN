@@ -223,8 +223,27 @@ class SecurityDecisionPoint:
                     final_decision = Decision.DENY
 
         # 7. No additional approval is required.
+        #
+        # authorization.decision here is either ALLOW or
+        # ALLOW_WITH_CONTROLS (REQUIRE_APPROVAL/DENY were already
+        # handled above, and approval.required is False in this
+        # branch). Preserve ALLOW_WITH_CONTROLS instead of collapsing
+        # it into plain ALLOW: a MEDIUM-risk operation is meant to
+        # execute automatically *with controls*, and losing that
+        # distinction here made it invisible to every consumer of
+        # `SecurityDecision.decision` -- including the audit log's own
+        # "decision" field, which previously reported "ALLOW" even
+        # when AuthorizationEngine had actually decided
+        # ALLOW_WITH_CONTROLS. ToolGateway treats both the same for
+        # execution purposes (see `_risk_is_consistent`/the DENY
+        # checks in `execute()`), so preserving the distinction here
+        # does not change whether anything runs -- only whether the
+        # true security posture is honestly recorded.
         else:
-            final_decision = Decision.ALLOW
+            if authorization.decision == Decision.ALLOW_WITH_CONTROLS:
+                final_decision = Decision.ALLOW_WITH_CONTROLS
+            else:
+                final_decision = Decision.ALLOW
 
         result = SecurityDecision(
             decision=final_decision,

@@ -44,7 +44,10 @@ def _build_conservative_gateway(tmp_dir: Path):
     A tool + matching permission both honestly declare CRITICAL risk,
     for a resource/action pair ("content_publishing"/"publish") that
     RiskEngine's hardcoded keyword lists do not recognize as dangerous
-    on their own (it would otherwise assess this as MEDIUM).
+    on their own (it would otherwise assess this as HIGH via the
+    generic unclassified-action fallback -- still short of the
+    CRITICAL risk the permission itself declares, which is exactly
+    the gap the effective-risk floor exists to close).
     """
 
     policy = {

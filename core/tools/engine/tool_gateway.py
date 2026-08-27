@@ -366,9 +366,21 @@ class ToolGateway:
 
         # ---------------------------------------------------------
         # 10. Fail closed on unknown decisions.
+        #
+        # ALLOW_WITH_CONTROLS is a real, distinct decision
+        # AuthorizationEngine can return for MEDIUM-risk operations
+        # (see authorization.py's `_decision_for_risk`) -- it means
+        # "execute automatically, within controls", not "unknown".
+        # SecurityDecisionPoint now preserves it instead of silently
+        # rewriting it to plain ALLOW, so this check must accept it
+        # too; otherwise every MEDIUM-risk tool call would newly and
+        # incorrectly fail closed here.
         # ---------------------------------------------------------
 
-        if security_decision.decision != Decision.ALLOW:
+        if security_decision.decision not in (
+            Decision.ALLOW,
+            Decision.ALLOW_WITH_CONTROLS,
+        ):
             return ToolExecutionResult(
                 status="DENIED",
                 summary="Unknown security decision; execution blocked.",

@@ -57,6 +57,42 @@ class AuthorizationEngine:
     anything unknown, malformed, or outside the declared policy is denied.
     """
 
+    # `permissions.json` may optionally document `defaults` and
+    # `risk_levels` sections describing the fail-closed/approval
+    # behavior this engine enforces. Those sections are NEVER read at
+    # decision time -- the actual enforcement is the hardcoded Python
+    # logic below and in ApprovalGate -- so they used to be pure,
+    # unverified documentation: editing the JSON to "change" security
+    # behavior had zero real effect, which directly undercuts
+    # SECURITY_SPEC.md's "complete and inspectable authorization
+    # decisions" principle. Rather than wiring the JSON up as a live
+    # configuration switch (a much larger, riskier change to
+    # security-critical code for a documentation-consistency problem),
+    # this engine now verifies at load time that if those sections are
+    # present, they still describe what the code actually does --
+    # turning silent, undetectable drift into a loud, immediate load
+    # error instead. This never affects any individual authorization
+    # decision; it only runs once, when the policy file is loaded.
+    _EXPECTED_DEFAULTS = {
+        "unknown_risk": "DENY",
+        "unknown_permission": "DENY",
+        "unknown_scope": "DENY",
+        "authorization_failure": "DENY",
+    }
+
+    _EXPECTED_RISK_LEVELS = {
+        "LOW": {"approval": "none", "default_decision": "ALLOW"},
+        "MEDIUM": {
+            "approval": "none",
+            "default_decision": "ALLOW_WITH_CONTROLS",
+        },
+        "HIGH": {"approval": "policy", "default_decision": "REQUIRE_APPROVAL"},
+        "CRITICAL": {
+            "approval": "human",
+            "default_decision": "REQUIRE_APPROVAL",
+        },
+    }
+
     def __init__(self, policy_path: str | Path):
         self.policy_path = Path(policy_path)
         self.policy = self._load_policy()
@@ -78,7 +114,44 @@ class AuthorizationEngine:
         if not isinstance(policy, dict):
             raise ValueError("Security policy must be a JSON object.")
 
+        self._validate_documented_defaults(policy)
+
         return policy
+
+    def _validate_documented_defaults(self, policy: dict[str, Any]) -> None:
+        """
+        Fail loudly if `defaults`/`risk_levels`, when present, no longer
+        match the behavior actually enforced in code. See the class-level
+        comment on `_EXPECTED_DEFAULTS` for why this exists.
+        """
+
+        defaults = policy.get("defaults")
+
+        if defaults is not None and defaults != self._EXPECTED_DEFAULTS:
+            raise ValueError(
+                f"{self.policy_path}: 'defaults' no longer matches the "
+                "fail-closed behavior AuthorizationEngine actually "
+                f"enforces (expected {self._EXPECTED_DEFAULTS!r}, found "
+                f"{defaults!r}). This section documents hardcoded "
+                "behavior -- it is not a live configuration switch. "
+                "Update AuthorizationEngine itself if the intended "
+                "behavior has genuinely changed, or revert this section "
+                "to match what the code does."
+            )
+
+        risk_levels = policy.get("risk_levels")
+
+        if risk_levels is not None and risk_levels != self._EXPECTED_RISK_LEVELS:
+            raise ValueError(
+                f"{self.policy_path}: 'risk_levels' no longer matches the "
+                "behavior AuthorizationEngine/ApprovalGate actually "
+                f"enforce (expected {self._EXPECTED_RISK_LEVELS!r}, found "
+                f"{risk_levels!r}). This section documents hardcoded "
+                "behavior -- it is not a live configuration switch. "
+                "Update AuthorizationEngine/ApprovalGate themselves if "
+                "the intended behavior has genuinely changed, or revert "
+                "this section to match what the code does."
+            )
 
     def authorize(
         self,

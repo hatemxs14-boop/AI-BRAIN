@@ -177,9 +177,27 @@ class RiskEngine:
                 levels.append(RiskLevel.LOW)
                 reasons.append("Read-only or analytical operation.")
             else:
-                levels.append(RiskLevel.MEDIUM)
+                # Genuinely unrecognized action/resource combination --
+                # SECURITY_SPEC.md's own risk model calls this the
+                # UNKNOWN case ("UNKNOWN -> deny"; "fail closed when
+                # authorization is uncertain"). A literal, separate
+                # UNKNOWN tier that hard-denies regardless of any
+                # permission would make every new, not-yet-vocabularied
+                # tool or action permanently unauthorizable even with
+                # explicit human approval -- the exact foot-gun already
+                # fixed twice elsewhere in this engine (a permission's
+                # own conservative risk_level used to be able to make a
+                # capability permanently unauthorizable the same way).
+                # HIGH achieves the same security intent without that
+                # trap: nothing unrecognized executes silently -- it
+                # requires at least a policy check-in first (see
+                # ApprovalGate) -- but a capability an admin has
+                # actually authorized can still run once approved,
+                # instead of being locked out forever.
+                levels.append(RiskLevel.HIGH)
                 reasons.append(
-                    "Operation is not explicitly classified as low risk."
+                    "Operation is not explicitly classified; treated as "
+                    "HIGH risk pending review of its actual risk profile."
                 )
 
         effective_level = max(levels)
