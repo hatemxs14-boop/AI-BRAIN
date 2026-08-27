@@ -1,4 +1,45 @@
 {
   "version": "1.0",
-  "permissions": []
+  "permissions": [
+    {
+      "subject": "research_agent",
+      "resource": "web_search",
+      "action": "search",
+      "scope": "public_web",
+      "risk_level": "LOW",
+      "approval": "none"
+    },
+    {
+      "subject": "research_agent",
+      "resource": "shell",
+      "action": "execute",
+      "scope": "workspace",
+      "risk_level": "HIGH",
+      "approval": "policy"
+    }
+  ],
+  "defaults": {
+    "unknown_risk": "DENY",
+    "unknown_permission": "DENY",
+    "unknown_scope": "DENY",
+    "authorization_failure": "DENY"
+  },
+  "risk_levels": {
+    "LOW": {
+      "approval": "none",
+      "default_decision": "ALLOW"
+    },
+    "MEDIUM": {
+      "approval": "none",
+      "default_decision": "ALLOW_WITH_CONTROLS"
+    },
+    "HIGH": {
+      "approval": "policy",
+      "default_decision": "REQUIRE_APPROVAL"
+    },
+    "CRITICAL": {
+      "approval": "human",
+      "default_decision": "REQUIRE_APPROVAL"
+    }
+  }
 }
