@@ -196,6 +196,19 @@ class AgentExecutionLoop:
 
                 self.agent.fail_task()
 
+                if self.action_provider is not None:
+
+                    return AgentLoopResult(
+                        status="INVALID_ACTION",
+                        steps=steps,
+                        last_result=last_result,
+                        reason=(
+                            "Action provider failed to produce "
+                            f"a valid AgentAction: {exc}"
+                        ),
+                        context=self.context,
+                    )
+
                 return AgentLoopResult(
                     status="DECISION_ERROR",
                     steps=steps,
@@ -257,19 +270,12 @@ class AgentExecutionLoop:
                     None,
                 )
 
-                validation_summary = getattr(
-                    validation,
-                    "summary",
-                    None,
-                )
-
                 return AgentLoopResult(
                     status="INVALID_ACTION",
                     steps=steps,
                     last_result=last_result,
                     reason=(
                         "Agent produced an invalid action. "
-                        f"summary={validation_summary!r}; "
                         f"errors={validation_details!r}; "
                         f"action={action!r}"
                     ),

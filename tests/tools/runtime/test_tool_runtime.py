@@ -19,7 +19,7 @@ from core.tools.runtime.tool_runtime import (
 )
 
 
-PERMISSIONS_FILE = r".\core\security\schemas\permissions.json"
+PERMISSIONS_FILE = "core/security/schemas/permissions.json"
 
 
 def build_gateway():

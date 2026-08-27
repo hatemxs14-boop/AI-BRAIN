@@ -10,7 +10,7 @@ from core.tools.registry.tool_registry import (
 )
 
 
-PERMISSIONS_FILE = r".\core\security\schemas\permissions.json"
+PERMISSIONS_FILE = "core/security/schemas/permissions.json"
 
 
 def build_gateway(

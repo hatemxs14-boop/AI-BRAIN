@@ -25,6 +25,10 @@ from core.llm.llm_request import (
     LLMRequest,
 )
 
+from core.tools.engine.tool_gateway import (
+    ToolExecutionResult,
+)
+
 
 class LLMDecisionEngine(AgentDecisionEngine):
     """
@@ -253,6 +257,20 @@ class LLMDecisionEngine(AgentDecisionEngine):
                 "artifacts": [],
             }
 
+        if not isinstance(result, ToolExecutionResult):
+            # Unrecognized result shape (e.g. a plain string or other
+            # value recorded directly into AgentContext). Without this
+            # fallback, getattr(..., default) silently returns the
+            # defaults for every field and the actual value is dropped
+            # entirely from the LLM's context -- the model would see
+            # an empty-looking tool result and could re-invoke the same
+            # tool or decide blind to what actually happened.
+            return {
+                "status": None,
+                "summary": str(result),
+                "artifacts": [],
+            }
+
         status = getattr(
             result,
             "status",
@@ -335,10 +353,15 @@ class LLMDecisionEngine(AgentDecisionEngine):
                 "LLM response must be a JSON object."
             )
 
-        required_fields = {
+        allowed_fields = {
             "action_type",
             "tool_id",
             "inputs",
+            "reason",
+        }
+
+        required_fields = {
+            "action_type",
             "reason",
         }
 
@@ -346,10 +369,10 @@ class LLMDecisionEngine(AgentDecisionEngine):
             data.keys()
         )
 
-        if actual_fields != required_fields:
+        missing = required_fields - actual_fields
+        extra = actual_fields - allowed_fields
 
-            missing = required_fields - actual_fields
-            extra = actual_fields - required_fields
+        if missing or extra:
 
             details = []
 
@@ -364,8 +387,9 @@ class LLMDecisionEngine(AgentDecisionEngine):
                 )
 
             raise ValueError(
-                "LLM response must contain exactly "
-                "action_type, tool_id, inputs, and reason. "
+                "LLM response must contain action_type and reason, "
+                "and may only additionally contain tool_id and "
+                "inputs. "
                 + " ".join(details)
             )
 
@@ -389,13 +413,13 @@ class LLMDecisionEngine(AgentDecisionEngine):
                 f"{action_type!r}."
             ) from exc
 
-        tool_id = data[
+        tool_id = data.get(
             "tool_id"
-        ]
+        )
 
-        inputs = data[
+        inputs = data.get(
             "inputs"
-        ]
+        )
 
         reason = data[
             "reason"

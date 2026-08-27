@@ -1,0 +1,29 @@
+[tool.pytest.ini_options]
+# Without this file, pytest has no fixed rootdir/config anchor, and its
+# legacy "prepend" import mode resolves each test file's dotted module name
+# by walking up through __init__.py files (tests/agents/ and tests/ have
+# them so they collect as "tests.agents.test_x"; tests/llm/ and tests/tools/
+# don't, so they collect as flat "test_x" modules). That mix is fragile
+# across machines/pytest versions and is the likely cause of the
+# "ModuleNotFoundError: No module named 'tests.agents'" /
+# "'tests.test_llm_contract'" collection errors.
+#
+# --import-mode=importlib replaces that path-walking with pytest importing
+# every test file directly (by file path, with a unique internal name),
+# independent of __init__.py placement or sys.path order.
+#
+# tests/agents/test_action_validation_integration.py still does an explicit
+# `from tests.agents.test_agent_loop import build_agent`, which is a normal
+# Python absolute import and needs the repo root on sys.path regardless of
+# pytest's import mode. `pythonpath` makes pytest add it for the duration of
+# the test run.
+addopts = "--import-mode=importlib"
+pythonpath = ["."]
+
+# Only collect our own suite. The repository also contains ecc/, a
+# separate, independently-versioned Git repository (see .gitignore) with
+# its own test-running conventions; without this, pytest also walks into
+# ecc/skills/skill-comply/tests and fails to collect it
+# (ModuleNotFoundError: No module named 'scripts'), which is unrelated to
+# AI-BRAIN and not something this project's test run should report on.
+testpaths = ["tests"]

@@ -17,6 +17,11 @@ ecc/
 # Logs
 *.log
 
+# Security audit log: generated at runtime (including on every test run,
+# since the test suite exercises the real AuditLogger against the default
+# path). It must never be a tracked, ever-growing source file.
+logs/security/*.jsonl
+
 # OS
 .DS_Store
 Thumbs.db

@@ -1,6 +1,25 @@
 ﻿from __future__ import annotations
 
-from openai import OpenAI
+import os
+
+import pytest
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
+# This module makes real, billed calls to the OpenAI API. It is an opt-in
+# end-to-end smoke test, not a hermetic unit test: it must not fail (or
+# block) a normal `pytest` run for contributors who have not installed the
+# `openai` package or configured an API key. Skip the whole module unless
+# both are explicitly present.
+if OpenAI is None or not os.environ.get("OPENAI_API_KEY"):
+    pytest.skip(
+        "Skipping live OpenAI integration test: install the 'openai' "
+        "package and set OPENAI_API_KEY to run it.",
+        allow_module_level=True,
+    )
 
 from core.agents.agent_action import AgentActionType
 from core.agents.agent_core import (
@@ -26,7 +45,7 @@ from core.tools.runtime.tool_runtime import ToolRuntime
 
 
 PERMISSIONS_FILE = (
-    r"core\security\schemas\permissions.json"
+    "core/security/schemas/permissions.json"
 )
 
 

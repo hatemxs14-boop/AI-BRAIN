@@ -30,7 +30,10 @@ from core.llm.llm_response import (
 
 class MockLLMClient(LLMClient):
 
-    def __init__(self, response: str):
+    def __init__(
+        self,
+        response: str,
+    ):
         self.response = response
         self.last_request: LLMRequest | None = None
 
@@ -72,9 +75,15 @@ def test_llm_decision_engine_returns_tool_action():
 
     action = engine.decide(context)
 
-    assert isinstance(action, AgentAction)
+    assert isinstance(
+        action,
+        AgentAction,
+    )
 
-    assert action.action_type == AgentActionType.INVOKE_TOOL
+    assert (
+        action.action_type
+        == AgentActionType.INVOKE_TOOL
+    )
 
     assert action.tool_id == "web_search"
 
@@ -90,11 +99,15 @@ def test_llm_decision_engine_builds_request_from_context():
     client = MockLLMClient(
         response=(
             '{"action_type":"COMPLETE",'
+            '"tool_id":null,'
+            '"inputs":null,'
             '"reason":"Task complete."}'
         )
     )
 
-    engine = LLMDecisionEngine(client)
+    engine = LLMDecisionEngine(
+        client
+    )
 
     context = AgentContext(
         task="Test task"
@@ -106,13 +119,24 @@ def test_llm_decision_engine_builds_request_from_context():
 
     assert request is not None
 
-    assert len(request.messages) == 2
+    assert len(
+        request.messages
+    ) == 2
 
-    assert request.messages[0].role == "system"
+    assert (
+        request.messages[0].role
+        == "system"
+    )
 
-    assert request.messages[1].role == "user"
+    assert (
+        request.messages[1].role
+        == "user"
+    )
 
-    assert "Test task" in request.messages[1].content
+    assert (
+        "Test task"
+        in request.messages[1].content
+    )
 
 
 def test_llm_decision_engine_returns_complete_action():
@@ -120,25 +144,37 @@ def test_llm_decision_engine_returns_complete_action():
     client = MockLLMClient(
         response=(
             '{"action_type":"COMPLETE",'
+            '"tool_id":null,'
+            '"inputs":null,'
             '"reason":"Task completed successfully."}'
         )
     )
 
-    engine = LLMDecisionEngine(client)
+    engine = LLMDecisionEngine(
+        client
+    )
 
     context = AgentContext(
         task="Complete this task"
     )
 
-    action = engine.decide(context)
+    action = engine.decide(
+        context
+    )
 
-    assert action.action_type == AgentActionType.COMPLETE
+    assert (
+        action.action_type
+        == AgentActionType.COMPLETE
+    )
 
     assert action.tool_id is None
 
     assert action.inputs is None
 
-    assert action.reason == "Task completed successfully."
+    assert (
+        action.reason
+        == "Task completed successfully."
+    )
 
 
 def test_llm_decision_engine_returns_fail_action():
@@ -146,25 +182,37 @@ def test_llm_decision_engine_returns_fail_action():
     client = MockLLMClient(
         response=(
             '{"action_type":"FAIL",'
+            '"tool_id":null,'
+            '"inputs":null,'
             '"reason":"Unable to continue."}'
         )
     )
 
-    engine = LLMDecisionEngine(client)
+    engine = LLMDecisionEngine(
+        client
+    )
 
     context = AgentContext(
         task="Impossible task"
     )
 
-    action = engine.decide(context)
+    action = engine.decide(
+        context
+    )
 
-    assert action.action_type == AgentActionType.FAIL
+    assert (
+        action.action_type
+        == AgentActionType.FAIL
+    )
 
     assert action.tool_id is None
 
     assert action.inputs is None
 
-    assert action.reason == "Unable to continue."
+    assert (
+        action.reason
+        == "Unable to continue."
+    )
 
 
 def test_llm_decision_engine_rejects_invalid_json():
@@ -173,14 +221,21 @@ def test_llm_decision_engine_rejects_invalid_json():
         response="THIS IS NOT JSON"
     )
 
-    engine = LLMDecisionEngine(client)
+    engine = LLMDecisionEngine(
+        client
+    )
 
     context = AgentContext(
         task="Test task"
     )
 
-    with pytest.raises(ValueError, match="not valid JSON"):
-        engine.decide(context)
+    with pytest.raises(
+        ValueError,
+        match="not valid JSON",
+    ):
+        engine.decide(
+            context
+        )
 
 
 def test_llm_decision_engine_rejects_non_object_json():
@@ -189,14 +244,21 @@ def test_llm_decision_engine_rejects_non_object_json():
         response='["INVALID"]'
     )
 
-    engine = LLMDecisionEngine(client)
+    engine = LLMDecisionEngine(
+        client
+    )
 
     context = AgentContext(
         task="Test task"
     )
 
-    with pytest.raises(ValueError, match="must be a JSON object"):
-        engine.decide(context)
+    with pytest.raises(
+        ValueError,
+        match="must be a JSON object",
+    ):
+        engine.decide(
+            context
+        )
 
 
 def test_llm_decision_engine_rejects_invalid_action_type():
@@ -204,11 +266,15 @@ def test_llm_decision_engine_rejects_invalid_action_type():
     client = MockLLMClient(
         response=(
             '{"action_type":"HACK_SYSTEM",'
+            '"tool_id":null,'
+            '"inputs":null,'
             '"reason":"Malicious action."}'
         )
     )
 
-    engine = LLMDecisionEngine(client)
+    engine = LLMDecisionEngine(
+        client
+    )
 
     context = AgentContext(
         task="Test task"
@@ -218,7 +284,9 @@ def test_llm_decision_engine_rejects_invalid_action_type():
         ValueError,
         match="invalid action_type",
     ):
-        engine.decide(context)
+        engine.decide(
+            context
+        )
 
 
 def test_llm_decision_engine_rejects_invalid_context():
@@ -226,17 +294,23 @@ def test_llm_decision_engine_rejects_invalid_context():
     client = MockLLMClient(
         response=(
             '{"action_type":"COMPLETE",'
+            '"tool_id":null,'
+            '"inputs":null,'
             '"reason":"Done."}'
         )
     )
 
-    engine = LLMDecisionEngine(client)
+    engine = LLMDecisionEngine(
+        client
+    )
 
     with pytest.raises(
         TypeError,
         match="context must be an AgentContext",
     ):
-        engine.decide("INVALID_CONTEXT")
+        engine.decide(
+            "INVALID_CONTEXT"
+        )
 
 
 def test_llm_decision_engine_rejects_invalid_client():
@@ -245,7 +319,9 @@ def test_llm_decision_engine_rejects_invalid_client():
         TypeError,
         match="client must implement LLMClient",
     ):
-        LLMDecisionEngine("INVALID_CLIENT")
+        LLMDecisionEngine(
+            "INVALID_CLIENT"
+        )
 
 
 def test_llm_decision_engine_passes_configuration():
@@ -253,6 +329,8 @@ def test_llm_decision_engine_passes_configuration():
     client = MockLLMClient(
         response=(
             '{"action_type":"COMPLETE",'
+            '"tool_id":null,'
+            '"inputs":null,'
             '"reason":"Done."}'
         )
     )
@@ -268,7 +346,9 @@ def test_llm_decision_engine_passes_configuration():
         task="Configuration test"
     )
 
-    engine.decide(context)
+    engine.decide(
+        context
+    )
 
     request = client.last_request
 
@@ -286,11 +366,15 @@ def test_llm_decision_engine_includes_tool_results_in_context():
     client = MockLLMClient(
         response=(
             '{"action_type":"COMPLETE",'
+            '"tool_id":null,'
+            '"inputs":null,'
             '"reason":"Research result received."}'
         )
     )
 
-    engine = LLMDecisionEngine(client)
+    engine = LLMDecisionEngine(
+        client
+    )
 
     context = AgentContext(
         task="Research AI"
@@ -300,10 +384,15 @@ def test_llm_decision_engine_includes_tool_results_in_context():
         "SEARCH RESULT"
     )
 
-    engine.decide(context)
+    engine.decide(
+        context
+    )
 
     request = client.last_request
 
     assert request is not None
 
-    assert "SEARCH RESULT" in request.messages[1].content
+    assert (
+        "SEARCH RESULT"
+        in request.messages[1].content
+    )

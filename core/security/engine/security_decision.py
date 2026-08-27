@@ -46,7 +46,7 @@ class SecurityDecisionPoint:
     def __init__(
         self,
         policy_path: str,
-        audit_log_path: str = r".\logs\security\audit.jsonl",
+        audit_log_path: str = "logs/security/audit.jsonl",
     ):
         self.risk_engine = RiskEngine()
         self.authorization_engine = AuthorizationEngine(policy_path)

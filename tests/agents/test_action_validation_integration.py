@@ -22,16 +22,14 @@ def test_execution_loop_rejects_invalid_action():
 
     def action_provider(current_agent):
 
-        return AgentAction(
-            action_type=(
-                AgentActionType.INVOKE_TOOL
-            ),
-            tool_id=None,
-            inputs={
-                "query": "AI agents",
-            },
-            reason="Invalid tool action.",
-        )
+        # AgentAction's own constructor already enforces the
+        # INVOKE_TOOL/tool_id/inputs contract (see
+        # test_action_validator.py's "*_rejected_by_action_contract"
+        # tests), so a malformed *AgentAction* can never be
+        # constructed here. What this test needs to exercise is the
+        # execution loop's handling of a decision engine that hands
+        # back something that isn't a valid AgentAction at all.
+        return "NOT_AN_AGENT_ACTION"
 
     loop = AgentExecutionLoop(
         agent=agent,

@@ -35,7 +35,7 @@ from core.security.engine.security_decision import (
 
 
 PERMISSIONS_FILE = (
-    r".\core\security\schemas\permissions.json"
+    "core/security/schemas/permissions.json"
 )
 
 

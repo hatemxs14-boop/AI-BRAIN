@@ -138,16 +138,14 @@ class AuthorizationEngine:
                 request=request,
             )
 
-        if self._risk_value(normalized_risk) < self._risk_value(permission_risk):
-            return AuthorizationResult(
-                decision=Decision.DENY,
-                reason=(
-                    "Requested risk level is lower than the permission's "
-                    "declared risk level."
-                ),
-                request=request,
-            )
-
+        # The permission's declared risk_level is a floor, not a ceiling:
+        # a policy author may mark a capability more conservatively than
+        # the independent RiskEngine assessment would. That must make the
+        # operation *more* controlled (higher effective risk), never
+        # unusable. Denying outright whenever the assessed risk happens to
+        # be lower than the declared permission risk would make any
+        # deliberately-conservative permission permanently unauthorizable,
+        # even with human approval, which contradicts the security model.
         effective_risk = max(
             self._risk_value(normalized_risk),
             self._risk_value(permission_risk),

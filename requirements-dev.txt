@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Needed to run the test suite under tests/.
+pytest
