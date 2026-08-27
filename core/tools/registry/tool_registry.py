@@ -30,6 +30,24 @@ class ToolDefinition:
 
     risk_level: str
 
+    # Required by TOOL_SPEC.md ("Every Tool Must Define ...
+    # error_handling") and its own rule "Tools must never hide
+    # important failures". A tool author must say explicitly whether a
+    # failed call is safe to retry and what should happen when it
+    # isn't -- this is the contract a future retry/timeout layer will
+    # read, and forcing it at registration time means a tool can never
+    # be silently registered without anyone having thought about its
+    # failure behavior.
+    #
+    # Required keys:
+    #   retryable   (bool)  -- is retrying this tool call ever safe?
+    #   on_failure  (str)   -- what should happen / be surfaced when
+    #                          this tool fails (non-empty).
+    # Optional key:
+    #   max_retries (int >= 0) -- required, and only meaningful, when
+    #                             retryable is True.
+    error_handling: dict[str, Any]
+
 
 class ToolRegistry:
     """
@@ -165,3 +183,88 @@ class ToolRegistry:
                 f"Expected one of: "
                 f"{sorted(self.VALID_RISK_LEVELS)}."
             )
+
+        # ---------------------------------------------------------
+        # Permission strings must actually describe THIS tool.
+        #
+        # ToolDefinition.permissions (subject:resource:action:scope)
+        # is a separate, advisory system used only for discovery
+        # filtering (ToolRuntime._subject_has_capability) -- the real
+        # authorization decision is made independently by
+        # AuthorizationEngine against permissions.json using
+        # tool.resource/action/scope directly. Nothing previously
+        # checked that the two agreed, so a copy-paste or typo in a
+        # permission string could make a tool wrongly appear
+        # "available" to a subject who isn't really authorized to run
+        # it (its real, dangerous resource/action/scope still fully
+        # exposed via discovery), or wrongly hidden from a subject who
+        # genuinely is. Failing loudly here, at registration, is far
+        # cheaper than that silently-wrong metadata surfacing later.
+        # ---------------------------------------------------------
+
+        for permission in tool.permissions:
+            segments = permission.split(":")
+
+            if len(segments) != 4:
+                raise ValueError(
+                    f"Tool '{tool.id}' has a malformed permission "
+                    f"'{permission}': expected exactly 4 "
+                    "colon-separated segments "
+                    "(subject:resource:action:scope)."
+                )
+
+            _subject, resource, action, scope = segments
+
+            if (resource, action, scope) != (
+                tool.resource,
+                tool.action,
+                tool.scope,
+            ):
+                raise ValueError(
+                    f"Tool '{tool.id}' declares permission "
+                    f"'{permission}' whose resource/action/scope "
+                    f"('{resource}:{action}:{scope}') does not match "
+                    "the tool's own registered resource/action/scope "
+                    f"('{tool.resource}:{tool.action}:{tool.scope}'). "
+                    "A tool's discovery permissions must describe the "
+                    "same capability the tool actually performs."
+                )
+
+        # ---------------------------------------------------------
+        # error_handling contract (TOOL_SPEC.md).
+        # ---------------------------------------------------------
+
+        if not isinstance(tool.error_handling, dict):
+            raise TypeError(
+                f"Tool '{tool.id}' error_handling must be a dictionary."
+            )
+
+        retryable = tool.error_handling.get("retryable")
+
+        if not isinstance(retryable, bool):
+            raise ValueError(
+                f"Tool '{tool.id}' error_handling must define a "
+                "boolean 'retryable'."
+            )
+
+        on_failure = tool.error_handling.get("on_failure")
+
+        if not isinstance(on_failure, str) or not on_failure.strip():
+            raise ValueError(
+                f"Tool '{tool.id}' error_handling must define a "
+                "non-empty string 'on_failure' describing what "
+                "happens when the tool fails."
+            )
+
+        if retryable:
+            max_retries = tool.error_handling.get("max_retries")
+
+            if (
+                not isinstance(max_retries, int)
+                or isinstance(max_retries, bool)
+                or max_retries < 0
+            ):
+                raise ValueError(
+                    f"Tool '{tool.id}' is marked retryable and must "
+                    "define a non-negative integer 'max_retries'."
+                )

@@ -55,9 +55,32 @@ class RiskEngine:
             reasons.append(f"Critical action: {action}")
 
         # Sensitive resources.
+        #
+        # This is necessarily a finite, hand-maintained vocabulary --
+        # anything not listed here falls through to the generic
+        # buckets below instead of CRITICAL. Reviewed and expanded
+        # once already after a real gap was found during audit
+        # (resource="ssh_credentials" fell through to LOW): the set
+        # below now covers the common synonyms for "this resource IS a
+        # secret", but any new resource name a tool author invents
+        # still needs to be added here explicitly. When adding a new
+        # sensitive tool, check this set first rather than assuming
+        # RiskEngine will "figure it out" from the name.
         if resource_value in {
             "secrets",
             "credentials",
+            "ssh_credentials",
+            "ssh_keys",
+            "api_key",
+            "api_keys",
+            "access_token",
+            "access_tokens",
+            "auth_token",
+            "auth_tokens",
+            "private_key",
+            "private_keys",
+            "password",
+            "passwords",
             "production_data",
             "security_policy",
             "system_privileges",
@@ -124,6 +147,18 @@ class RiskEngine:
             if resource_value in {
                 "secrets",
                 "credentials",
+                "ssh_credentials",
+                "ssh_keys",
+                "api_key",
+                "api_keys",
+                "access_token",
+                "access_tokens",
+                "auth_token",
+                "auth_tokens",
+                "private_key",
+                "private_keys",
+                "password",
+                "passwords",
                 "private_data",
                 "personal_data",
             }:

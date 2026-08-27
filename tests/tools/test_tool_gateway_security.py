@@ -46,6 +46,11 @@ def build_gateway(
             action="search",
             scope="public_web",
             risk_level="LOW",
+            error_handling={
+                "retryable": True,
+                "max_retries": 2,
+                "on_failure": "Surface the search error to the agent.",
+            },
         )
     )
 
@@ -206,6 +211,11 @@ def test_direct_executor_is_not_exposed_by_definition():
             action="search",
             scope="public_web",
             risk_level="LOW",
+            error_handling={
+                "retryable": True,
+                "max_retries": 2,
+                "on_failure": "Surface the search error to the agent.",
+            },
         )
     )
 
@@ -306,6 +316,13 @@ def test_high_risk_requires_approval():
             action="execute",
             scope="workspace",
             risk_level="HIGH",
+            error_handling={
+                "retryable": False,
+                "on_failure": (
+                    "Do not retry a shell command automatically; "
+                    "surface the failure for human review."
+                ),
+            },
         )
     )
 

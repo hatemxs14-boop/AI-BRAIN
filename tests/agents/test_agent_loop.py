@@ -67,6 +67,11 @@ def build_agent() -> AgentCore:
             action="search",
             scope="public_web",
             risk_level="LOW",
+            error_handling={
+                "retryable": True,
+                "max_retries": 2,
+                "on_failure": "Surface the search error to the agent.",
+            },
         )
     )
 
