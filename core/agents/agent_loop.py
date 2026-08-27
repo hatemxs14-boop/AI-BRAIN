@@ -36,9 +36,13 @@ class AgentLoopResult:
     """
 
     status: str
+
     steps: int
+
     last_result: ToolExecutionResult | None
+
     reason: str | None
+
     context: AgentContext
 
 
@@ -46,35 +50,30 @@ class AgentExecutionLoop:
     """
     Controlled execution loop for an AI-BRAIN Agent.
 
-    The loop:
+    Responsibilities:
 
-        AgentContext
-            ↓
-        Decision Engine
-            ↓
-        AgentAction
-            ↓
-        AgentActionValidator
-            ↓
-        AgentCore
-            ↓
-        AgentToolInterface
-            ↓
-        ToolRuntime
-            ↓
-        ToolGateway
-            ↓
-        Security Layer
-            ↓
-        Private Executor
+    - obtain the current AgentContext
+    - discover available tools
+    - request the next AgentAction
+    - validate the AgentAction
+    - execute valid actions through AgentCore
+    - record tool results
+    - stop on COMPLETE
+    - stop on FAIL
+    - handle decision errors
+    - handle validation errors
+    - handle tool execution errors
+    - handle approval-required results
+    - enforce max_steps
 
-    The loop never:
+    The loop does not:
 
-    - executes tools directly
-    - accesses executors
-    - accesses the Security Layer directly
-    - grants permissions
-    - bypasses AgentCore
+    - execute tools directly
+    - access executors
+    - access the Security Layer directly
+    - grant permissions
+    - approve security requests
+    - bypass AgentCore
     """
 
     def __init__(
@@ -291,9 +290,26 @@ class AgentExecutionLoop:
                 == AgentActionType.COMPLETE
             ):
 
-                self.agent.execute_action(
-                    action
-                )
+                try:
+
+                    self.agent.execute_action(
+                        action
+                    )
+
+                except Exception as exc:
+
+                    self.agent.fail_task()
+
+                    return AgentLoopResult(
+                        status="EXECUTION_ERROR",
+                        steps=steps,
+                        last_result=last_result,
+                        reason=(
+                            "Completion action failed: "
+                            f"{exc}"
+                        ),
+                        context=self.context,
+                    )
 
                 return AgentLoopResult(
                     status="COMPLETED",
@@ -308,9 +324,26 @@ class AgentExecutionLoop:
                 == AgentActionType.FAIL
             ):
 
-                self.agent.execute_action(
-                    action
-                )
+                try:
+
+                    self.agent.execute_action(
+                        action
+                    )
+
+                except Exception as exc:
+
+                    self.agent.fail_task()
+
+                    return AgentLoopResult(
+                        status="EXECUTION_ERROR",
+                        steps=steps,
+                        last_result=last_result,
+                        reason=(
+                            "Failure action failed: "
+                            f"{exc}"
+                        ),
+                        context=self.context,
+                    )
 
                 return AgentLoopResult(
                     status="FAILED",
@@ -327,7 +360,7 @@ class AgentExecutionLoop:
 
                 try:
 
-                    last_result = (
+                    execution_result = (
                         self.agent.execute_action(
                             action
                         )
@@ -338,7 +371,7 @@ class AgentExecutionLoop:
                     self.agent.fail_task()
 
                     return AgentLoopResult(
-                        status="FAILED",
+                        status="EXECUTION_ERROR",
                         steps=steps,
                         last_result=last_result,
                         reason=(
@@ -348,11 +381,76 @@ class AgentExecutionLoop:
                         context=self.context,
                     )
 
+                if not isinstance(
+                    execution_result,
+                    ToolExecutionResult,
+                ):
+
+                    self.agent.fail_task()
+
+                    return AgentLoopResult(
+                        status="EXECUTION_ERROR",
+                        steps=steps,
+                        last_result=last_result,
+                        reason=(
+                            "AgentCore returned an invalid "
+                            "tool execution result."
+                        ),
+                        context=self.context,
+                    )
+
+                last_result = execution_result
+
                 self.context.record_tool_result(
-                    last_result
+                    execution_result
                 )
 
-                self._refresh_available_tools()
+                result_status = getattr(
+                    execution_result,
+                    "status",
+                    None,
+                )
+
+                if result_status == "APPROVAL_REQUIRED":
+
+                    self.agent.fail_task()
+
+                    return AgentLoopResult(
+                        status="APPROVAL_REQUIRED",
+                        steps=steps,
+                        last_result=last_result,
+                        reason=(
+                            getattr(
+                                execution_result,
+                                "summary",
+                                None,
+                            )
+                            or (
+                                "Tool execution requires "
+                                "additional approval."
+                            )
+                        ),
+                        context=self.context,
+                    )
+
+                if result_status != "SUCCESS":
+
+                    self.agent.fail_task()
+
+                    return AgentLoopResult(
+                        status="TOOL_ERROR",
+                        steps=steps,
+                        last_result=last_result,
+                        reason=(
+                            getattr(
+                                execution_result,
+                                "summary",
+                                None,
+                            )
+                            or "Tool execution failed."
+                        ),
+                        context=self.context,
+                    )
 
                 continue
 
@@ -387,9 +485,10 @@ class AgentExecutionLoop:
         """
         Refresh the tools exposed to the decision engine.
 
-        Discovery is performed through AgentToolInterface.
+        Tool discovery is performed through
+        AgentToolInterface.
 
-        This does not authorize execution.
+        Discovery does not authorize execution.
         """
 
         if self.context is None:
@@ -422,6 +521,10 @@ class AgentExecutionLoop:
                     "risk_level": tool.risk_level,
                 }
             )
+
+        self.context.set_available_tools(
+            available_tools
+        )
 
         self.context.set_metadata(
             "available_tools",
