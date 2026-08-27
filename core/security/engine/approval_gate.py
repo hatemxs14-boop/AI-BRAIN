@@ -171,7 +171,19 @@ class ApprovalGate:
                     ),
                 )
 
-        elif approval_decision.approval_type != "policy":
+        elif approval_decision.approval_type == "policy":
+            if not approved_by:
+                return ApprovalResult(
+                    approved=False,
+                    approved_by=None,
+                    reason=(
+                        "Policy approval requires an explicit "
+                        "identity for who or what asserted the "
+                        "policy was satisfied."
+                    ),
+                )
+
+        else:
             return ApprovalResult(
                 approved=False,
                 approved_by=approved_by,

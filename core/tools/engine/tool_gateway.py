@@ -140,6 +140,7 @@ class ToolGateway:
         tool_kwargs: dict[str, Any] | None = None,
         approved: bool | None = None,
         approved_by: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> ToolExecutionResult:
         """
         Execute a registered tool through the complete security boundary.
@@ -278,6 +279,7 @@ class ToolGateway:
                 resource=resource,
                 action=action,
                 scope=scope,
+                metadata=metadata,
             )
         else:
             security_decision = self.security.evaluate_with_approval(
@@ -287,14 +289,26 @@ class ToolGateway:
                 scope=scope,
                 approved=approved,
                 approved_by=approved_by,
+                metadata=metadata,
             )
 
         # ---------------------------------------------------------
         # 7. Verify risk consistency.
+        #
+        # Compared against the EFFECTIVE risk the Security Layer
+        # actually decided on (security_decision.risk.level is the
+        # raw, pre-permission-floor RiskEngine assessment -- comparing
+        # against that instead reintroduces the exact "conservative
+        # permission becomes permanently unauthorizable" bug that was
+        # already fixed in AuthorizationEngine.authorize(), just one
+        # layer up: a tool honestly declaring a higher risk_level than
+        # RiskEngine's keyword heuristic would guess was being denied
+        # here unconditionally, even with valid policy and explicit
+        # human approval).
         # ---------------------------------------------------------
 
         registered_risk = tool.risk_level
-        assessed_risk = security_decision.risk.level.name
+        assessed_risk = security_decision.authorization.effective_risk
 
         if not self._risk_is_consistent(
             registered_risk=registered_risk,

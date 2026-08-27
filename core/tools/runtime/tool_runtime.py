@@ -94,6 +94,7 @@ class ToolRuntime:
             tool_kwargs=invocation.inputs,
             approved=invocation.approved,
             approved_by=invocation.approved_by,
+            metadata=invocation.metadata,
         )
 
     def has_tool(

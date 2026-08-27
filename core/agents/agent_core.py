@@ -156,6 +156,23 @@ class AgentCore:
 
         self.state.status = "FAILED"
 
+    def await_approval(self) -> None:
+        """
+        Mark the current task as paused pending additional approval.
+
+        This is deliberately distinct from `fail_task()`: a HIGH/
+        CRITICAL-risk tool call that comes back APPROVAL_REQUIRED is
+        not a failure -- it's a recoverable pause. The task can be
+        resumed (with an explicit approval decision) once approval is
+        obtained. Reusing FAILED for this case made an in-progress,
+        resumable task indistinguishable from a genuinely dead one to
+        anything reading `agent.state.status` (e.g.
+        `get_state_snapshot()`), which the richer, one-shot
+        `AgentLoopResult.status` value has always distinguished.
+        """
+
+        self.state.status = "AWAITING_APPROVAL"
+
     def discover_tools(
         self,
     ) -> tuple[ToolDiscovery, ...]:

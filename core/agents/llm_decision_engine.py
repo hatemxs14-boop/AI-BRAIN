@@ -141,10 +141,15 @@ class LLMDecisionEngine(AgentDecisionEngine):
         It does not receive executor access.
         """
 
-        available_tools = context.get_metadata(
-            "available_tools",
-            [],
-        )
+        # Read the validated field (populated exclusively through
+        # AgentContext.set_available_tools's id/shape checks), not the
+        # informal "available_tools" metadata copy the execution loop
+        # also happens to write. Reading the metadata copy meant
+        # set_available_tools's validation never actually protected
+        # what reaches the LLM prompt -- it validated a value nothing
+        # consumed, while a second, unvalidated copy of the same data
+        # was what the LLM actually saw.
+        available_tools = context.available_tools
 
         if not isinstance(
             available_tools,

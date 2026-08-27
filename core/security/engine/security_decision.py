@@ -15,6 +15,7 @@ from .authorization import (
 )
 from .audit_logger import AuditLogger
 from .risk_engine import RiskAssessment, RiskEngine
+from .risk_engine import RiskLevel as EngineRiskLevel
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,7 @@ class SecurityDecisionPoint:
         resource: str,
         action: str,
         scope: str,
+        metadata: dict | None = None,
     ) -> SecurityDecision:
         """
         Evaluate an operation without supplying an approval decision.
@@ -71,6 +73,12 @@ class SecurityDecisionPoint:
         succeeds but an approval boundary is required.
 
         Unauthorized operations always return DENY.
+
+        `metadata` is caller-supplied context (e.g. a correlation ID or
+        approval justification attached to the originating tool
+        invocation). It is informational only -- it never affects the
+        decision -- and is recorded in the audit trail so it isn't
+        silently lost between the caller and the audit log.
         """
 
         return self._evaluate(
@@ -80,6 +88,7 @@ class SecurityDecisionPoint:
             scope=scope,
             approved=None,
             approved_by=None,
+            metadata=metadata,
         )
 
     def evaluate_with_approval(
@@ -91,6 +100,7 @@ class SecurityDecisionPoint:
         scope: str,
         approved: bool,
         approved_by: str | None = None,
+        metadata: dict | None = None,
     ) -> SecurityDecision:
         """
         Evaluate an operation with an explicit approval decision.
@@ -104,6 +114,8 @@ class SecurityDecisionPoint:
         - expand scope,
         - bypass authorization,
         - bypass CRITICAL human-approval requirements.
+
+        `metadata` is informational only; see `evaluate()`.
         """
 
         return self._evaluate(
@@ -113,6 +125,7 @@ class SecurityDecisionPoint:
             scope=scope,
             approved=approved,
             approved_by=approved_by,
+            metadata=metadata,
         )
 
     def _evaluate(
@@ -124,6 +137,7 @@ class SecurityDecisionPoint:
         scope: str,
         approved: bool | None,
         approved_by: str | None,
+        metadata: dict | None = None,
     ) -> SecurityDecision:
         # 1. Determine the actual risk independently.
         risk = self.risk_engine.assess(
@@ -132,7 +146,10 @@ class SecurityDecisionPoint:
             scope=scope,
         )
 
-        # 2. Check explicit authorization.
+        # 2. Check explicit authorization. This also computes the
+        #    effective risk: the independently-assessed risk, floored
+        #    (raised, never lowered) by the matched permission's own
+        #    declared risk_level when one applies.
         authorization = self.authorization_engine.authorize(
             subject=subject,
             resource=resource,
@@ -141,8 +158,21 @@ class SecurityDecisionPoint:
             risk_level=risk.level.name,
         )
 
-        # 3. Determine whether additional approval is required.
-        approval = self.approval_gate.evaluate(risk.level)
+        # 3. Determine whether additional approval is required, using
+        #    the SAME effective risk that just determined the
+        #    authorization decision -- never the pre-floor raw
+        #    assessment. Using the raw assessment here let a
+        #    deliberately-conservative permission (declared risk higher
+        #    than RiskEngine's raw classification) drive authorization
+        #    into REQUIRE_APPROVAL/DENY while `approval.approval_type`
+        #    was still computed for the lower, un-floored tier -- e.g.
+        #    "none" or "policy" when the real tier was CRITICAL/"human"
+        #    -- which made `approval_gate.resolve()` reject even an
+        #    explicit, valid human approval with "Unknown approval
+        #    type; approval denied."
+        approval = self.approval_gate.evaluate(
+            EngineRiskLevel[authorization.effective_risk]
+        )
 
         approval_result: ApprovalResult | None = None
 
@@ -213,6 +243,7 @@ class SecurityDecisionPoint:
             "scope": scope,
             "risk_level": risk.level.name,
             "risk_reasons": list(risk.reasons),
+            "effective_risk": authorization.effective_risk,
             "authorization": authorization.decision.value,
             "authorization_reason": authorization.reason,
             "approval_required": approval.required,
@@ -233,6 +264,9 @@ class SecurityDecisionPoint:
                     "approval_result_reason": approval_result.reason,
                 }
             )
+
+        if metadata is not None:
+            audit_event["metadata"] = metadata
 
         self.audit_logger.record(audit_event)
 

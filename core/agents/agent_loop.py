@@ -413,7 +413,7 @@ class AgentExecutionLoop:
 
                 if result_status == "APPROVAL_REQUIRED":
 
-                    self.agent.fail_task()
+                    self.agent.await_approval()
 
                     return AgentLoopResult(
                         status="APPROVAL_REQUIRED",

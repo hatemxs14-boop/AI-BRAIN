@@ -36,6 +36,18 @@ class AuthorizationResult:
     reason: str
     request: AuthorizationRequest
 
+    # The risk level that actually drove `decision` -- the independently
+    # assessed risk floored (raised, never lowered) by the matched
+    # permission's own declared risk_level, when one was matched.
+    #
+    # Every downstream consumer that needs to know "how risky did the
+    # Security Layer ultimately treat this operation" (approval-type
+    # selection, tool/permission risk-consistency checks, audit records)
+    # MUST read this field instead of re-deriving risk on its own --
+    # otherwise it can disagree with the decision actually made here,
+    # which is exactly the class of bug this field exists to prevent.
+    effective_risk: str
+
 
 class AuthorizationEngine:
     """
@@ -92,6 +104,12 @@ class AuthorizationEngine:
                 decision=Decision.DENY,
                 reason="Unknown risk level.",
                 request=request,
+                # The input risk classification itself is invalid, so
+                # there is nothing valid to float a floor from. Fail
+                # closed to the strictest tier rather than guessing --
+                # this value is only consumed for audit/approval-type
+                # bookkeeping on an already-DENYed request.
+                effective_risk="CRITICAL",
             )
 
         if not all(
@@ -102,6 +120,7 @@ class AuthorizationEngine:
                 decision=Decision.DENY,
                 reason="Malformed authorization request.",
                 request=request,
+                effective_risk=normalized_risk,
             )
 
         permissions = self.policy.get("permissions")
@@ -111,6 +130,7 @@ class AuthorizationEngine:
                 decision=Decision.DENY,
                 reason="Invalid permissions policy.",
                 request=request,
+                effective_risk=normalized_risk,
             )
 
         matching_permission = self._find_matching_permission(
@@ -125,6 +145,7 @@ class AuthorizationEngine:
                 decision=Decision.DENY,
                 reason="No explicit permission grants this capability.",
                 request=request,
+                effective_risk=normalized_risk,
             )
 
         permission_risk = str(
@@ -136,6 +157,7 @@ class AuthorizationEngine:
                 decision=Decision.DENY,
                 reason="Permission contains an unknown risk level.",
                 request=request,
+                effective_risk=normalized_risk,
             )
 
         # The permission's declared risk_level is a floor, not a ceiling:
@@ -146,17 +168,18 @@ class AuthorizationEngine:
         # be lower than the declared permission risk would make any
         # deliberately-conservative permission permanently unauthorizable,
         # even with human approval, which contradicts the security model.
-        effective_risk = max(
+        effective_risk_value = max(
             self._risk_value(normalized_risk),
             self._risk_value(permission_risk),
         )
 
-        decision = self._decision_for_risk(effective_risk)
+        decision = self._decision_for_risk(effective_risk_value)
 
         return AuthorizationResult(
             decision=decision,
             reason="Explicit permission matched.",
             request=request,
+            effective_risk=self._risk_name(effective_risk_value),
         )
 
     def _find_matching_permission(
@@ -197,6 +220,17 @@ class AuthorizationEngine:
         }
 
         return values[risk_level]
+
+    @staticmethod
+    def _risk_name(risk_value: int) -> str:
+        names = {
+            1: "LOW",
+            2: "MEDIUM",
+            3: "HIGH",
+            4: "CRITICAL",
+        }
+
+        return names[risk_value]
 
     @staticmethod
     def _decision_for_risk(risk_value: int) -> Decision:
