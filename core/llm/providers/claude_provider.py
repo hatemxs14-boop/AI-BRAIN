@@ -20,6 +20,25 @@ class ClaudeProvider(LLMClient):
     - access the Security Layer
     """
 
+    # Shared with OpenAIProvider so LLMRequest(max_tokens=None) behaves
+    # identically regardless of which provider is configured, instead
+    # of silently falling back to whatever each vendor SDK happens to
+    # default to on its own (which can vary by model and change
+    # between SDK versions).
+    _DEFAULT_MAX_TOKENS = 1024
+
+    # Anthropic's `stop_reason` values normalized into the small,
+    # provider-independent vocabulary LLMResponse.finish_reason uses
+    # (see OpenAIProvider._FINISH_REASON_MAP for the OpenAI side).
+    # Callers that need the exact vendor value can still read it off
+    # `LLMResponse.raw`.
+    _FINISH_REASON_MAP = {
+        "end_turn": "stop",
+        "stop_sequence": "stop",
+        "max_tokens": "length",
+        "tool_use": "tool_use",
+    }
+
     def __init__(self, client) -> None:
         self.client = client
 
@@ -77,7 +96,7 @@ class ClaudeProvider(LLMClient):
             "max_tokens": (
                 request.max_tokens
                 if request.max_tokens is not None
-                else 1024
+                else self._DEFAULT_MAX_TOKENS
             ),
             "messages": messages,
         }
@@ -111,6 +130,23 @@ class ClaudeProvider(LLMClient):
             if isinstance(text, str):
                 text_parts.append(text)
 
+        if not text_parts:
+            # No text content at all (e.g. the response contains only
+            # a tool_use block, or Anthropic returned an unexpectedly
+            # empty content list). Previously this silently produced
+            # `content=""`, which an empty response and a genuine
+            # "the model said nothing" case both looked like -- the
+            # caller only found out something was wrong indirectly,
+            # several layers later, from a confusing JSON-parse
+            # failure. OpenAIProvider already raises immediately for
+            # its equivalent "no usable content" case; this keeps both
+            # providers consistent instead of one failing loudly and
+            # the other failing silently.
+            raise ValueError(
+                "Claude response contains no text content "
+                f"(stop_reason={getattr(response, 'stop_reason', None)!r})."
+            )
+
         content = "".join(text_parts)
 
         return LLMResponse(
@@ -120,10 +156,18 @@ class ClaudeProvider(LLMClient):
                 "model",
                 request.model,
             ),
-            finish_reason=getattr(
-                response,
-                "stop_reason",
-                None,
+            finish_reason=self._normalize_finish_reason(
+                getattr(response, "stop_reason", None)
             ),
             raw=response,
         )
+
+    @classmethod
+    def _normalize_finish_reason(
+        cls,
+        raw_stop_reason: str | None,
+    ) -> str | None:
+        if raw_stop_reason is None:
+            return None
+
+        return cls._FINISH_REASON_MAP.get(raw_stop_reason, "other")

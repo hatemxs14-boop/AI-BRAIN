@@ -77,7 +77,9 @@ def test_claude_provider_returns_normalized_response():
     assert isinstance(response, LLMResponse)
     assert response.content == "Hello from Claude."
     assert response.model == "claude-test"
-    assert response.finish_reason == "end_turn"
+    # Normalized from Anthropic's raw "end_turn" into the shared
+    # cross-provider vocabulary (see ClaudeProvider._FINISH_REASON_MAP).
+    assert response.finish_reason == "stop"
 
 
 def test_claude_provider_builds_request_correctly():

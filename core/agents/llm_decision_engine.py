@@ -104,6 +104,28 @@ class LLMDecisionEngine(AgentDecisionEngine):
                 "LLM returned no response."
             )
 
+        # Both providers normalize their vendor-specific stop reason
+        # into a shared vocabulary (see ClaudeProvider/OpenAIProvider
+        # `_FINISH_REASON_MAP`); "length" means the model was cut off
+        # by max_tokens before it finished. Left unchecked, a truncated
+        # response almost always fails a few lines below with an
+        # opaque "LLM response is not valid JSON" -- which looks like
+        # the model returned garbage, when the real, actionable cause
+        # is that max_tokens was too low for this response. Checking
+        # it here turns that into a clear, specific diagnosis instead.
+        finish_reason = getattr(
+            response,
+            "finish_reason",
+            None,
+        )
+
+        if finish_reason == "length":
+            raise ValueError(
+                "LLM response was truncated because it reached the "
+                "max_tokens limit before completing its action JSON. "
+                "Increase max_tokens or shorten the prompt/context."
+            )
+
         content = getattr(
             response,
             "content",
