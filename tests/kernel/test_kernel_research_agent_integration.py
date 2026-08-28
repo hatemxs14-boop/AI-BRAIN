@@ -79,7 +79,13 @@ def _make_findings_root() -> str:
     return tempfile.mkdtemp()
 
 
-def test_build_default_kernel_registers_research_agent():
+def test_build_default_kernel_registers_both_agents():
+    """
+    As of Build Phase 8, build_default_kernel() registers both
+    research_agent and writer_agent, research_agent first (see
+    core/kernel/default_kernel.py's own docstring for why registration
+    order matters as the genuine-tie tiebreak).
+    """
     docs_root = _make_documents_root()
     findings_root = _make_findings_root()
     audit_dir = tempfile.mkdtemp()
@@ -96,7 +102,8 @@ def test_build_default_kernel_registers_research_agent():
         )
 
         assert [r.subject for r in kernel._registrations] == [
-            "research_agent"
+            "research_agent",
+            "writer_agent",
         ]
     finally:
         shutil.rmtree(docs_root)
@@ -120,7 +127,11 @@ def test_kernel_run_completes_a_read_document_task_through_research_agent():
             orchestration_engine=SequentialOrchestrationEngine(),
         )
 
-        result = kernel.run("Summarize sample.txt.", max_steps=3)
+        # "Read document" (not "Summarize") deliberately: this task
+        # must classify to research_agent, not writer_agent -- see
+        # core/kernel/default_kernel.py's _RESEARCH_AGENT_KEYWORDS/
+        # _WRITER_AGENT_KEYWORDS.
+        result = kernel.run("Read document sample.txt.", max_steps=3)
 
         assert result.status == "COMPLETED"
         assert result.subject == "research_agent"
@@ -151,7 +162,11 @@ def test_kernel_run_surfaces_write_findings_approval_required_through_research_a
             orchestration_engine=SequentialOrchestrationEngine(),
         )
 
-        result = kernel.run("Persist a finding.", max_steps=3)
+        # "Research and persist" (not just "Persist") deliberately:
+        # this task must classify to research_agent, not
+        # NO_AGENT_AVAILABLE -- see core/kernel/default_kernel.py's
+        # _RESEARCH_AGENT_KEYWORDS/_WRITER_AGENT_KEYWORDS.
+        result = kernel.run("Research and persist a finding.", max_steps=3)
 
         assert result.status == "AWAITING_APPROVAL"
         assert not Path(findings_root, "finding.md").exists()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Callable
 
@@ -16,6 +17,11 @@ from core.agents.research_agent import (
     DEFAULT_FINDINGS_ROOT,
     DEFAULT_PERMISSIONS_PATH,
     build_research_agent,
+)
+
+from core.agents.writer_agent import (
+    DEFAULT_REPORTS_ROOT,
+    build_writer_agent,
 )
 
 from core.kernel.kernel import (
@@ -38,28 +44,107 @@ from core.policies.policy_engine import (
 
 
 # ---------------------------------------------------------------------
-# Convenience wiring: a Kernel with research_agent registered, the
-# same way core/agents/research_agent.py's own build_research_agent()
-# is a convenience wiring of the tool/security stack.
+# Convenience wiring: a Kernel with both research_agent and
+# writer_agent registered (Build Phase 8), the same way
+# core/agents/research_agent.py's own build_research_agent() and
+# core/agents/writer_agent.py's own build_writer_agent() are
+# convenience wirings of each agent's own tool/security stack.
 #
-# research_agent is still the only agent this project has, so
-# `_always_handles` below is deliberately trivial (accepts every
-# task). A real multi-agent classifier belongs here once a second
-# agent exists to classify against -- see Kernel._classify()'s own
-# docstring in core/kernel/kernel.py.
+# Until Build Phase 8, research_agent was this project's only
+# registered agent, so its `can_handle` was `_always_handles`
+# (accepted every task) -- Kernel._classify() had nothing to actually
+# classify between. With a second agent now registered, both
+# predicates below are real: a finite, hand-maintained keyword
+# vocabulary per agent, in the same spirit as RiskEngine's own
+# keyword-heuristic classification (Pass 3 finding I) -- not a real
+# NLU classifier (no such subsystem exists in this project), but a
+# genuine, testable discriminator rather than the previous
+# accept-everything placeholder. A task matching both vocabularies (or
+# neither) is handled exactly as Kernel._classify()/_select_agent()
+# already document: every match is collected, and the first in
+# registration order is selected (research_agent is registered first,
+# so it wins a genuine tie) -- STRATEGY SELECTION remains "run one
+# matching agent", unchanged by this phase; only which agents can
+# match at all is new. See Kernel._classify()'s own docstring in
+# core/kernel/kernel.py for the unchanged selection mechanism itself.
+#
+# Matching is whole-word, not plain substring: a first draft of this
+# module matched keywords with a plain `keyword in text` check, and
+# tests/kernel/test_kernel_writer_agent_integration.py's own
+# "Summarize finding.md." case caught it immediately -- research_
+# agent's "find" keyword is a substring of "finding"/"findings", which
+# is exactly the vocabulary writer_agent's own domain (reading
+# research *findings*) uses constantly, so plain substring matching
+# misrouted a writer_agent task to research_agent on nearly every real
+# phrasing. Every keyword below is matched with `\bkeyword\b` instead,
+# so "find" no longer matches inside "finding" (no word boundary
+# between "find" and the following "ing"), while multi-word phrases
+# like "read document" still match as a whole phrase.
 # ---------------------------------------------------------------------
 
 
-def _always_handles(normalized: NormalizedTask) -> bool:
+_RESEARCH_AGENT_KEYWORDS: tuple[str, ...] = (
+    "research",
+    "search",
+    "find",
+    "investigate",
+    "look up",
+    "gather",
+    "read the document",
+    "read document",
+    "read the webpage",
+    "read webpage",
+)
+
+_WRITER_AGENT_KEYWORDS: tuple[str, ...] = (
+    "write",
+    "draft",
+    "report",
+    "summarize",
+    "summarise",
+    "summary",
+    "compose",
+)
+
+
+def _contains_keyword(text: str, keywords: tuple[str, ...]) -> bool:
     """
-    research_agent is currently the only registered agent, so it
-    accepts every task. Replace with a real capability predicate
-    (keyword/domain matching, or an LLM-based router) once a second
-    agent is registered and tasks must actually be classified between
-    them.
+    True if `text` (already lowercased) contains any of `keywords` as
+    a whole word/phrase -- `\\bkeyword\\b`, not a plain substring
+    check. See this module's own docstring for why plain substring
+    matching was wrong (it let research_agent's "find" keyword match
+    inside "finding"/"findings").
     """
 
-    return True
+    return any(
+        re.search(r"\b" + re.escape(keyword) + r"\b", text)
+        for keyword in keywords
+    )
+
+
+def _research_agent_handles(normalized: NormalizedTask) -> bool:
+    """
+    Real (v1) capability predicate for research_agent: matches when
+    the normalized task text contains any of a finite, hand-maintained
+    set of research/evidence-gathering keywords, as a whole word or
+    phrase (see _contains_keyword). See this module's own docstring
+    for why this is a deliberate keyword heuristic, not a real NLU
+    classifier.
+    """
+
+    return _contains_keyword(normalized.text.lower(), _RESEARCH_AGENT_KEYWORDS)
+
+
+def _writer_agent_handles(normalized: NormalizedTask) -> bool:
+    """
+    Real (v1) capability predicate for writer_agent: matches when the
+    normalized task text contains any of a finite, hand-maintained set
+    of writing/reporting keywords, as a whole word or phrase (see
+    _contains_keyword). See this module's own docstring for why this
+    is a deliberate keyword heuristic, not a real NLU classifier.
+    """
+
+    return _contains_keyword(normalized.text.lower(), _WRITER_AGENT_KEYWORDS)
 
 
 def build_default_kernel(
@@ -68,6 +153,7 @@ def build_default_kernel(
     decision_engine_factory: Callable[[], AgentDecisionEngine] | None = None,
     documents_root: str | Path = DEFAULT_DOCUMENTS_ROOT,
     findings_root: str | Path = DEFAULT_FINDINGS_ROOT,
+    reports_root: str | Path = DEFAULT_REPORTS_ROOT,
     serper_api_key: str | None = None,
     permissions_path: str | Path = DEFAULT_PERMISSIONS_PATH,
     audit_log_path: str | None = None,
@@ -79,7 +165,8 @@ def build_default_kernel(
     policy_engine: PolicyEngine | None = None,
 ) -> Kernel:
     """
-    Build a Kernel with research_agent already registered.
+    Build a Kernel with both research_agent and writer_agent already
+    registered.
 
     Provide exactly one of `llm_client_factory` (a zero-argument
     callable returning a fresh LLMClient; wrapped in a fresh
@@ -87,7 +174,11 @@ def build_default_kernel(
     `temperature`/`max_tokens`) or `decision_engine_factory` (a
     zero-argument callable returning a fresh AgentDecisionEngine
     directly -- e.g. a DeterministicDecisionEngine for testing, or a
-    caller-configured LLMDecisionEngine).
+    caller-configured LLMDecisionEngine). The same factory is shared by
+    both agents -- it only encapsulates which model/client is used,
+    never per-agent state (each Kernel.run() attempt calls it fresh via
+    the selected AgentRegistration's own build_decision_engine, per
+    AgentRegistration's own docstring).
 
     A *factory* is required, not an instance, for the same reason
     AgentRegistration.build_agent is a factory: a decision engine (or
@@ -95,9 +186,15 @@ def build_default_kernel(
     instance across unrelated Kernel.run() calls is a footgun this
     signature avoids by construction.
 
-    `documents_root`/`findings_root`/`serper_api_key`/
-    `permissions_path`/`audit_log_path` are passed straight through to
-    build_research_agent() -- see that function's own docstring.
+    `documents_root`/`findings_root`/`serper_api_key` are passed
+    straight through to build_research_agent() -- see that function's
+    own docstring. `findings_root`/`reports_root` are passed straight
+    through to build_writer_agent() -- `findings_root` is deliberately
+    the SAME parameter research_agent writes into, so writer_agent
+    reads exactly what research_agent has actually persisted (see
+    core/agents/writer_agent.py's own docstring for this pipeline
+    link). `permissions_path`/`audit_log_path` are shared by both
+    agents' security stacks.
 
     `policy_engine` is passed straight through to Kernel() -- see its
     own docstring (core/kernel/kernel.py). Defaults to a fresh
@@ -130,11 +227,19 @@ def build_default_kernel(
             "decision_engine_factory must be callable."
         )
 
-    def build_agent():
+    def build_research():
         return build_research_agent(
             documents_root=documents_root,
             findings_root=findings_root,
             serper_api_key=serper_api_key,
+            permissions_path=permissions_path,
+            audit_log_path=audit_log_path,
+        )
+
+    def build_writer():
+        return build_writer_agent(
+            findings_root=findings_root,
+            reports_root=reports_root,
             permissions_path=permissions_path,
             audit_log_path=audit_log_path,
         )
@@ -153,8 +258,23 @@ def build_default_kernel(
                 "persists findings when explicitly approved. See "
                 "core/agents/RESEARCH_AGENT.md."
             ),
-            can_handle=_always_handles,
-            build_agent=build_agent,
+            can_handle=_research_agent_handles,
+            build_agent=build_research,
+            build_decision_engine=decision_engine_factory,
+        )
+    )
+
+    kernel.register_agent(
+        AgentRegistration(
+            subject="writer_agent",
+            description=(
+                "Synthesizes already-persisted research findings "
+                "into a written report and publishes it when "
+                "explicitly approved. See "
+                "core/agents/WRITER_AGENT.md."
+            ),
+            can_handle=_writer_agent_handles,
+            build_agent=build_writer,
             build_decision_engine=decision_engine_factory,
         )
     )
