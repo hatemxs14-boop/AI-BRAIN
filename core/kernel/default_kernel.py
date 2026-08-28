@@ -29,11 +29,18 @@ from core.agents.reviewer_agent import (
     build_reviewer_agent,
 )
 
+from core.agents.agent_loop import (
+    AgentLoopResult,
+)
+
 from core.kernel.kernel import (
     AgentRegistration,
     Kernel,
     NormalizedTask,
+    WorkflowDefinition,
+    WorkflowStep,
     WorkflowVerifierRegistration,
+    extract_first_artifact_path,
 )
 
 from core.llm.llm_client import (
@@ -218,6 +225,145 @@ def _reviewer_agent_handles(normalized: NormalizedTask) -> bool:
     return _contains_keyword(normalized.text.lower(), _REVIEWER_AGENT_KEYWORDS)
 
 
+# ---------------------------------------------------------------------
+# Build Phase 15: this project's first concrete, real
+# core.kernel.kernel.WorkflowDefinition -- "research_write_review",
+# chaining research_agent -> writer_agent -> reviewer_agent end-to-end
+# from a single instruction, via the new Kernel.run_workflow(). See
+# WorkflowDefinition's, WorkflowStep's, and Kernel.run_workflow()'s own
+# docstrings in core/kernel/kernel.py for the full mechanism and its
+# stop-at-approval/stop-at-failure/no-whole-workflow-retry semantics.
+# This is deliberately the very same three agents and the very same
+# research -> write -> review order AGENT_REGISTRY.md has referenced
+# since Build Phase 11 ("completing a research -> write -> review
+# pipeline") and Build Phase 12's own `_trigger_independent_verification`
+# already automates the LAST hop of (writer_agent -> reviewer_agent,
+# after a successful write_report). This workflow does not replace that
+# Build Phase 12 mechanism -- a caller can still use plain Kernel.run()
+# plus `enable_independent_verification` for the two-stage case -- it
+# adds a genuinely new, third entry point for a caller who wants the
+# WHOLE three-stage pipeline kicked off from one instruction instead of
+# invoking each agent by hand.
+#
+# `can_handle` is a real, hand-maintained, CONJUNCTIVE predicate, not
+# just OR-ing the three agents' own keyword vocabularies together: it
+# requires the task to contain a research-signal keyword AND a
+# writer-signal keyword (research_write_review's own two starting
+# stages -- reviewer_agent's own stage is always implied by choosing
+# this workflow, so its vocabulary is deliberately not required here
+# too). A plain "write a report" (writer_agent alone, no research
+# signal) or "research the topic" (research_agent alone, no write
+# signal) does NOT match this workflow's own can_handle -- exactly
+# because Kernel.run_workflow() is an entirely separate method from
+# Kernel.run() (see run_workflow's own docstring): there is no
+# collision to guard against between this workflow's vocabulary and
+# any single agent's, since the two are never evaluated by the same
+# selection call. The conjunctive design here instead guards against a
+# WEAKER mistake this project has already made twice for single-agent
+# routing (Build Phase 8's "find"/"finding" substring bug, Build Phase
+# 11's "report" keyword-overlap bug): an OR of all three vocabularies
+# would let a task that only ever intended a single stage (e.g. "review
+# the report", matching only _REVIEWER_AGENT_KEYWORDS) accidentally
+# match this workflow too, if a caller ever did decide to try both
+# Kernel.run() and Kernel.run_workflow() against the same task text.
+# Requiring the research+write signals together keeps this workflow's
+# own vocabulary meaningfully distinguishable from any one agent's.
+# ---------------------------------------------------------------------
+
+
+def _research_write_review_handles(normalized: NormalizedTask) -> bool:
+    """
+    Real (v1) capability predicate for the "research_write_review"
+    workflow: matches only when the normalized task text contains BOTH
+    a research-signal keyword AND a writer-signal keyword (see this
+    module's own docstring above for why conjunctive, not either
+    vocabulary alone).
+    """
+
+    text = normalized.text.lower()
+
+    return _contains_keyword(
+        text, _RESEARCH_AGENT_KEYWORDS
+    ) and _contains_keyword(text, _WRITER_AGENT_KEYWORDS)
+
+
+def _research_write_review_step_1_task(
+    original_task: str,
+    previous_result: AgentLoopResult | None,
+) -> str:
+    """
+    research_agent's own step: the workflow's original task text,
+    verbatim -- there is no previous step to build from yet.
+    """
+
+    return original_task
+
+
+def _research_write_review_step_2_task(
+    original_task: str,
+    previous_result: AgentLoopResult | None,
+) -> str:
+    """
+    writer_agent's own step: a real task naming the exact findings
+    artifact path research_agent's own step just published, built via
+    extract_first_artifact_path -- the same convention
+    _trigger_independent_verification (Build Phase 12) already
+    established for handing one agent's completed artifact to the
+    next. Raises ValueError (reported by Kernel.run_workflow() as
+    WorkflowRunResult.status == "STEP_TASK_BUILD_ERROR", never as an
+    uncaught exception) when `previous_result` is missing or carries no
+    usable artifact -- there is nothing for writer_agent to write from
+    otherwise.
+    """
+
+    if previous_result is None:
+        raise ValueError(
+            "writer_agent's workflow step requires research_agent's "
+            "own completed result from the previous step."
+        )
+
+    path = extract_first_artifact_path(previous_result)
+
+    if path is None:
+        raise ValueError(
+            "research_agent's result carries no usable findings "
+            "artifact path for writer_agent to write a report from."
+        )
+
+    return f"Write a report summarizing the findings in {path}."
+
+
+def _research_write_review_step_3_task(
+    original_task: str,
+    previous_result: AgentLoopResult | None,
+) -> str:
+    """
+    reviewer_agent's own step: a real task naming the exact report
+    artifact path writer_agent's own step just published -- the same
+    `f"Review {path}."` phrasing
+    _trigger_independent_verification (Build Phase 12) already uses for
+    this exact hand-off. Raises ValueError (see step 2's own docstring
+    for why that is the correct, expected failure mode here) when
+    `previous_result` is missing or carries no usable artifact.
+    """
+
+    if previous_result is None:
+        raise ValueError(
+            "reviewer_agent's workflow step requires writer_agent's "
+            "own completed result from the previous step."
+        )
+
+    path = extract_first_artifact_path(previous_result)
+
+    if path is None:
+        raise ValueError(
+            "writer_agent's result carries no usable report artifact "
+            "path for reviewer_agent to review."
+        )
+
+    return f"Review {path}."
+
+
 def build_default_kernel(
     *,
     llm_client_factory: Callable[[], LLMClient] | None = None,
@@ -237,6 +383,7 @@ def build_default_kernel(
     policy_engine: PolicyEngine | None = None,
     enable_independent_verification: bool = False,
     enable_memory_retrieval: bool = False,
+    enable_research_write_review_workflow: bool = False,
 ) -> Kernel:
     """
     Build a Kernel with research_agent, writer_agent, and
@@ -309,6 +456,28 @@ def build_default_kernel(
     execution) and why it defaults to False for the same "no existing
     caller's behavior or test counts change unless they opt in" reason
     `enable_independent_verification` already established above.
+
+    `enable_research_write_review_workflow` (Build Phase 15, default
+    False) opts into this Kernel's first concrete
+    core.kernel.kernel.WorkflowDefinition: when True, registers
+    "research_write_review" (research_agent -> writer_agent ->
+    reviewer_agent, chained via the new Kernel.run_workflow()) using
+    fresh research_agent/writer_agent/reviewer_agent factories built
+    from this same call's own `documents_root`/`findings_root`/
+    `reports_root`/`memory_store_path`/`serper_api_key`/
+    `permissions_path`/`audit_log_path` -- exactly the same wiring
+    `build_research`/`build_writer`/`build_reviewer` below already use
+    for standalone registration, so a task routed through this workflow
+    reads and writes the exact same findings/reports locations a
+    standalone Kernel.run() call for any of these three agents would.
+    Defaults to False for the same "no existing caller's behavior, or
+    test counts, change unless they opt in" reason
+    `enable_independent_verification` and `enable_memory_retrieval`
+    already established above -- registering this workflow does not
+    itself change what any ordinary Kernel.run() call does (see
+    WorkflowDefinition's own docstring for why the two selection paths
+    can never collide), but it is still additive surface area a caller
+    must ask for explicitly.
     """
 
     if decision_engine_factory is None:
@@ -429,5 +598,32 @@ def build_default_kernel(
             build_decision_engine=decision_engine_factory,
         )
     )
+
+    if enable_research_write_review_workflow:
+        kernel.register_workflow(
+            WorkflowDefinition(
+                name="research_write_review",
+                description=(
+                    "Chains research_agent -> writer_agent -> "
+                    "reviewer_agent end-to-end from one instruction. "
+                    "See this module's own docstring above."
+                ),
+                can_handle=_research_write_review_handles,
+                steps=(
+                    WorkflowStep(
+                        subject="research_agent",
+                        build_task=_research_write_review_step_1_task,
+                    ),
+                    WorkflowStep(
+                        subject="writer_agent",
+                        build_task=_research_write_review_step_2_task,
+                    ),
+                    WorkflowStep(
+                        subject="reviewer_agent",
+                        build_task=_research_write_review_step_3_task,
+                    ),
+                ),
+            )
+        )
 
     return kernel

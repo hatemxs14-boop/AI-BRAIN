@@ -84,10 +84,23 @@ from core.policies.policy_engine import (
 #                           has -- this step is a no-op for every
 #                           existing caller that doesn't opt in.
 #   STRATEGY SELECTION      real but simple (_select_strategy) --
-#                           only "run one matching agent" exists
-#                           today; ranking multiple candidates is
-#                           future work once more than one agent is
-#                           registered
+#                           still exactly "run one matching agent" for
+#                           an ordinary Kernel.run() call; ranking
+#                           multiple candidates for a single task
+#                           remains future work. As of Build Phase 15,
+#                           a caller who wants a real multi-agent plan
+#                           instead calls the new, separate
+#                           Kernel.run_workflow() -- a declarative,
+#                           hand-registered WorkflowDefinition of
+#                           ordered WorkflowStep entries, each reusing
+#                           an already-registered agent -- rather than
+#                           this step growing that choice itself. See
+#                           WorkflowDefinition's own docstring below for
+#                           why a separate method, not a change to
+#                           _select_strategy/_select_agent, is how this
+#                           project answers AGENT_REGISTRY.md's
+#                           Collaboration section and this docstring's
+#                           own long-standing "future phase" note.
 #   AGENT SELECTION         real (_select_agent)
 #   MODEL SELECTION         delegated: each AgentRegistration's
 #                           build_decision_engine() factory already
@@ -465,6 +478,241 @@ class WorkflowVerifierRegistration:
             )
 
 
+def extract_first_artifact_path(loop_result: AgentLoopResult) -> str | None:
+    """
+    Shared helper (Build Phase 15): the path of the first artifact
+    `loop_result.last_result` reports, if any.
+
+    This is exactly the duck-typed artifact-extraction logic
+    Kernel._trigger_independent_verification introduced in Build Phase
+    12 (handling both a dict artifact's `.get("path")` and an object
+    artifact's `getattr(..., "path", None)`), pulled out into its own
+    module-level function so Build Phase 15's WorkflowStep task
+    builders (see core/kernel/default_kernel.py) can reuse the exact
+    same convention rather than maintaining a second, subtly different
+    copy of it. `_trigger_independent_verification` itself now calls
+    this helper too, instead of the inline block it used to have.
+
+    Returns `None` -- never raises -- whenever `loop_result.last_result`
+    is `None`, carries no artifacts, or the first artifact carries no
+    usable non-empty string `path`. This function only ever describes
+    what is actually available; a caller that cannot proceed without an
+    artifact (e.g. a WorkflowStep.build_task building the next step's
+    task text) is responsible for raising its own error from a `None`
+    result -- see WorkflowStep's own docstring below for exactly how
+    Kernel.run_workflow() handles that.
+    """
+
+    last_result = loop_result.last_result
+
+    if last_result is None:
+        return None
+
+    artifacts = getattr(last_result, "artifacts", None) or ()
+
+    if not artifacts:
+        return None
+
+    first_artifact = artifacts[0]
+
+    if isinstance(first_artifact, dict):
+        path = first_artifact.get("path")
+    else:
+        path = getattr(first_artifact, "path", None)
+
+    if not isinstance(path, str) or not path.strip():
+        return None
+
+    return path
+
+
+@dataclass(frozen=True)
+class WorkflowStep:
+    """
+    One step of a WorkflowDefinition (Build Phase 15): which agent
+    runs, and how to build the task text it runs with.
+
+    `subject` must name an agent already registered with this Kernel
+    via register_agent() -- Kernel.register_workflow() enforces this
+    eagerly, at registration time (see its own docstring). Deliberately
+    NOT its own build_agent/build_decision_engine pair (unlike
+    AgentRegistration and WorkflowVerifierRegistration): a workflow
+    step always runs through the SAME registration ordinary CLASSIFY/
+    _select_agent routing would use for that subject, so a workflow can
+    never run an agent under different tools, permissions, or model
+    wiring than that same agent would run under if invoked directly --
+    POLICY_SPEC.md's Agent Constraints apply identically either way.
+
+    `build_task` builds this step's task text. Called with
+    (the workflow's own original task text, the PREVIOUS step's
+    AgentLoopResult -- `None` for the first step, since there is no
+    previous result yet) and must return a non-empty string. Mirrors
+    the established `f"Review {path}."` pattern
+    _trigger_independent_verification (Build Phase 12) already uses to
+    build a follow-on task from a prior step's artifact -- see
+    extract_first_artifact_path above, which every WorkflowStep in this
+    project should use for that extraction rather than re-deriving it.
+    `build_task` is free to raise (e.g. when the previous result
+    carries no usable artifact to build this step's task from);
+    Kernel.run_workflow() catches that and reports it as
+    WorkflowRunResult.status == "STEP_TASK_BUILD_ERROR" rather than
+    letting it propagate out of an otherwise-normal Kernel call.
+    """
+
+    subject: str
+    build_task: Callable[[str, AgentLoopResult | None], str]
+
+    def __post_init__(self) -> None:
+
+        if not isinstance(self.subject, str) or not self.subject.strip():
+            raise ValueError(
+                "WorkflowStep.subject must be a non-empty string."
+            )
+
+        if not callable(self.build_task):
+            raise TypeError("WorkflowStep.build_task must be callable.")
+
+
+@dataclass(frozen=True)
+class WorkflowDefinition:
+    """
+    Registers one named, declarative, multi-step workflow with the
+    Kernel (Build Phase 15): a real answer to AGENT_REGISTRY.md's own
+    Collaboration section ("Multiple agents may be selected when the
+    task contains independent domains... parallel execution reduces
+    total execution time... specialized expertise is required") and to
+    Kernel._select_strategy's own long-standing docstring, which has
+    named "choosing a multi-agent plan" as an intentional future
+    extension point since before this phase existed.
+
+    This is deliberately a hand-registered, declarative sequence, not a
+    free-text planner: this project has no natural-language planning
+    subsystem, and fabricating one here would hide that gap behind code
+    that looks like it does more than it does (the same honesty
+    standard every prior Build Phase has held to). What this phase adds
+    is real: given one instruction that matches a workflow's own
+    `can_handle`, the Kernel now runs a whole named, ordered sequence of
+    already-registered agents end-to-end via Kernel.run_workflow(),
+    instead of a caller having to invoke each agent by hand and wire
+    the hand-off itself.
+
+    `can_handle` is evaluated only by Kernel.run_workflow() -- entirely
+    separate from Kernel.run()'s own CLASSIFY/_select_agent routing, so
+    registering a workflow can never change which single agent an
+    ordinary Kernel.run() call selects for any existing task, and a
+    workflow's own vocabulary can never collide with an agent's (they
+    are matched by different methods entirely). A caller decides
+    up front whether it wants ordinary single-agent routing (Kernel.run)
+    or a named multi-step workflow (Kernel.run_workflow).
+
+    `steps` must contain at least two WorkflowStep entries -- a
+    single-step "workflow" is just Kernel.run() under a different name,
+    and this project already has that method.
+    """
+
+    name: str
+    description: str
+    can_handle: Callable[[NormalizedTask], bool]
+    steps: tuple[WorkflowStep, ...]
+
+    def __post_init__(self) -> None:
+
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError(
+                "WorkflowDefinition.name must be a non-empty string."
+            )
+
+        if not isinstance(self.description, str) or not self.description.strip():
+            raise ValueError(
+                "WorkflowDefinition.description must be a non-empty "
+                "string."
+            )
+
+        if not callable(self.can_handle):
+            raise TypeError(
+                "WorkflowDefinition.can_handle must be callable."
+            )
+
+        if not isinstance(self.steps, tuple) or not all(
+            isinstance(step, WorkflowStep) for step in self.steps
+        ):
+            raise TypeError(
+                "WorkflowDefinition.steps must be a tuple of "
+                "WorkflowStep."
+            )
+
+        if len(self.steps) < 2:
+            raise ValueError(
+                "WorkflowDefinition.steps must contain at least two "
+                "steps -- a single-step workflow is just Kernel.run()."
+            )
+
+
+@dataclass(frozen=True)
+class WorkflowStepResult:
+    """
+    One completed (or halted-at) step of a Kernel.run_workflow() run.
+    """
+
+    subject: str
+    loop_result: AgentLoopResult
+    verification: KernelVerification
+
+
+@dataclass(frozen=True)
+class WorkflowRunResult:
+    """
+    Final result of Kernel.run_workflow() (Build Phase 15).
+
+    `status` values:
+
+        NO_WORKFLOW_AVAILABLE   no registered WorkflowDefinition's
+                                  can_handle predicate matched the
+                                  task; nothing was executed.
+        COMPLETED                every step ran, reported COMPLETED,
+                                  and passed verification.
+        AWAITING_APPROVAL        a step's own AgentLoopResult was
+                                  APPROVAL_REQUIRED -- the workflow
+                                  stops here, exactly like Kernel.run()
+                                  itself never silently resolves an
+                                  approval gate (KERNEL_SPEC.md Sec.3:
+                                  "never silently make irreversible
+                                  decisions"). Automating a sequence of
+                                  agents must never bypass an approval
+                                  gate any single one of them would
+                                  otherwise stop at.
+        VERIFICATION_FAILED      a step reported COMPLETED but did not
+                                  pass verification -- the workflow
+                                  stops here rather than feeding an
+                                  unverified result into the next step.
+        STEP_TASK_BUILD_ERROR    a step's own `build_task` raised (most
+                                  often: the previous step's result
+                                  carried no usable artifact to build
+                                  this step's task from).
+        (anything else)          passed through verbatim from the
+                                  halting step's own AgentLoopResult.
+                                  status (FAILED, TOOL_ERROR,
+                                  MAX_STEPS_EXCEEDED, DECISION_ERROR,
+                                  INVALID_ACTION, EXECUTION_ERROR) --
+                                  the same "don't invent new vocabulary"
+                                  rule KernelResult's own docstring
+                                  already states.
+
+    `completed_steps` is every step that actually ran, in order,
+    including whichever step halted the workflow (that step's own
+    `loop_result`/`verification` show exactly why). Per-step recovery
+    (RECOVER IF NEEDED) is still applied to each individual step exactly
+    as Kernel.run() applies it to a standalone task; there is no
+    additional whole-workflow-level retry -- deliberately deferred as
+    future work, so this phase does not overstate what it does.
+    """
+
+    status: str
+    workflow_name: str
+    completed_steps: tuple[WorkflowStepResult, ...]
+    reason: str | None
+
+
 class Kernel:
     """
     Real (v1) implementation of the Brain Kernel described in
@@ -554,6 +802,7 @@ class Kernel:
             )
 
         self._registrations: list[AgentRegistration] = []
+        self._workflows: list[WorkflowDefinition] = []
 
         self.max_recovery_attempts = max_recovery_attempts
 
@@ -621,6 +870,58 @@ class Kernel:
                 )
 
         self._registrations.append(registration)
+
+    def register_workflow(
+        self,
+        workflow: WorkflowDefinition,
+    ) -> None:
+        """
+        Register one WorkflowDefinition with the Kernel (Build Phase
+        15), for later selection by Kernel.run_workflow().
+
+        Raises ValueError if a workflow is already registered under
+        the same name -- registrations are not silently overwritten,
+        mirroring register_agent()'s own duplicate-name rejection.
+
+        Raises ValueError if any of `workflow.steps` names a subject
+        with no matching AgentRegistration already registered on this
+        Kernel via register_agent(). A workflow step always reuses an
+        already-registered agent (see WorkflowStep's own docstring for
+        why); naming an unregistered subject is a genuine build-time
+        misconfiguration, and this catches it here, at registration
+        time, rather than only the first time Kernel.run_workflow()
+        actually reaches that step. This is why
+        core/kernel/default_kernel.py's build_default_kernel() always
+        registers every agent a workflow depends on before registering
+        the workflow itself.
+        """
+
+        if not isinstance(workflow, WorkflowDefinition):
+            raise TypeError("workflow must be a WorkflowDefinition.")
+
+        for existing in self._workflows:
+            if existing.name == workflow.name:
+                raise ValueError(
+                    "A workflow is already registered under the name "
+                    f"{workflow.name!r}."
+                )
+
+        registered_subjects = {
+            registration.subject for registration in self._registrations
+        }
+
+        for step in workflow.steps:
+            if step.subject not in registered_subjects:
+                raise ValueError(
+                    f"WorkflowDefinition {workflow.name!r} names "
+                    f"subject {step.subject!r} in one of its steps, "
+                    "but no agent is registered for that subject on "
+                    "this Kernel. Register every agent a workflow "
+                    "depends on before registering the workflow "
+                    "itself."
+                )
+
+        self._workflows.append(workflow)
 
     def run(
         self,
@@ -699,6 +1000,224 @@ class Kernel:
             policy_evaluation=policy_evaluation,
             independent_verification=independent_verification,
             retrieved_context=retrieved_context,
+        )
+
+    def run_workflow(
+        self,
+        task: str,
+        *,
+        max_steps: int = 10,
+    ) -> WorkflowRunResult:
+        """
+        Run a registered, declarative, multi-step WorkflowDefinition
+        for one objective (Build Phase 15) -- see WorkflowDefinition's
+        own docstring for what this is and is not, and
+        WorkflowRunResult's own docstring for the full status
+        vocabulary.
+
+        Entirely separate from Kernel.run()'s own NORMALIZE/CLASSIFY/
+        AGENT SELECTION pipeline: this selects a WorkflowDefinition
+        (first registered workflow whose `can_handle` matches, mirroring
+        _select_agent's own first-match-in-registration-order rule), not
+        a single agent, and a caller decides up front which of the two
+        methods it wants. Registering a workflow can never change what
+        an ordinary Kernel.run() call does for any task, and vice versa.
+
+        Each step is executed exactly the way Kernel.run() executes its
+        own single agent -- a fresh PLAN built from that step's
+        registration, run through the SAME OrchestrationEngine, with
+        the SAME RECOVER IF NEEDED retry policy (`self.
+        max_recovery_attempts`, `self._should_recover`) applied
+        individually to that one step. There is no additional
+        whole-workflow-level retry: if a step exhausts its own recovery
+        attempts and still doesn't complete, the workflow stops there
+        (see below) -- deliberately deferred as future work rather than
+        silently claimed here.
+
+        The workflow STOPS at the first step whose result is not a
+        verified COMPLETED, in this order of precedence:
+
+          1. APPROVAL_REQUIRED  -> WorkflowRunResult.status
+                                    "AWAITING_APPROVAL". Never silently
+                                    resolved, never skipped, exactly
+                                    like Kernel.run() itself
+                                    (KERNEL_SPEC.md Sec.3).
+          2. any other non-COMPLETED loop status (FAILED, TOOL_ERROR,
+             MAX_STEPS_EXCEEDED, DECISION_ERROR, INVALID_ACTION,
+             EXECUTION_ERROR) -> passed through verbatim as
+             WorkflowRunResult.status, mirroring KernelResult's own
+             "don't invent new vocabulary" rule.
+          3. COMPLETED but verification does not pass -> "
+             VERIFICATION_FAILED" -- the unverified result is never fed
+             into the next step's `build_task`.
+
+        Before a step even runs, its own `build_task` is called (with
+        the workflow's original task text and the previous step's
+        AgentLoopResult, `None` for the first step) to build that
+        step's task text; if `build_task` raises, the workflow stops
+        with WorkflowRunResult.status == "STEP_TASK_BUILD_ERROR" and
+        that step's own attempt is never made -- there is nothing to
+        execute without a task.
+
+        Returns WorkflowRunResult.status == "NO_WORKFLOW_AVAILABLE",
+        with an empty `completed_steps`, when no registered
+        WorkflowDefinition's `can_handle` matched -- mirroring
+        Kernel.run()'s own "NO_AGENT_AVAILABLE" precedent exactly:
+        nothing was executed, and this is not itself an error.
+        """
+
+        normalized = self._normalize(task)
+
+        workflow = self._select_workflow(normalized)
+
+        if workflow is None:
+            return WorkflowRunResult(
+                status="NO_WORKFLOW_AVAILABLE",
+                workflow_name="",
+                completed_steps=(),
+                reason=(
+                    "No registered workflow's can_handle predicate "
+                    "matched this task."
+                ),
+            )
+
+        completed_steps: list[WorkflowStepResult] = []
+        previous_result: AgentLoopResult | None = None
+
+        for step in workflow.steps:
+
+            registration = self._find_registration(step.subject)
+
+            try:
+                step_task_text = step.build_task(
+                    normalized.text, previous_result
+                )
+            except Exception as exc:  # noqa: BLE001 -- a step's own
+                # build_task is caller-supplied and may fail for any
+                # reason (most often: no usable artifact in the
+                # previous step's result); this is reported as a
+                # normal, inspectable WorkflowRunResult, not an
+                # uncaught exception out of an otherwise-real Kernel
+                # call.
+                return WorkflowRunResult(
+                    status="STEP_TASK_BUILD_ERROR",
+                    workflow_name=workflow.name,
+                    completed_steps=tuple(completed_steps),
+                    reason=(
+                        f"Step {step.subject!r}'s build_task raised "
+                        f"while building its task text: {exc}"
+                    ),
+                )
+
+            step_normalized = self._normalize(step_task_text)
+
+            recovery_attempts = 0
+            loop_result = self._execute_once(
+                registration=registration,
+                normalized=step_normalized,
+                max_steps=max_steps,
+            )
+
+            while (
+                recovery_attempts < self.max_recovery_attempts
+                and self._should_recover(loop_result)
+            ):
+                recovery_attempts += 1
+
+                loop_result = self._execute_once(
+                    registration=registration,
+                    normalized=step_normalized,
+                    max_steps=max_steps,
+                )
+
+            verification = self._verify(loop_result)
+
+            completed_steps.append(
+                WorkflowStepResult(
+                    subject=step.subject,
+                    loop_result=loop_result,
+                    verification=verification,
+                )
+            )
+
+            if loop_result.status == "APPROVAL_REQUIRED":
+                return WorkflowRunResult(
+                    status="AWAITING_APPROVAL",
+                    workflow_name=workflow.name,
+                    completed_steps=tuple(completed_steps),
+                    reason=(
+                        f"Step {step.subject!r} is awaiting human "
+                        "approval; the workflow has stopped here."
+                    ),
+                )
+
+            if loop_result.status != "COMPLETED":
+                return WorkflowRunResult(
+                    status=loop_result.status,
+                    workflow_name=workflow.name,
+                    completed_steps=tuple(completed_steps),
+                    reason=(
+                        f"Step {step.subject!r} did not complete "
+                        f"(status={loop_result.status!r}); the "
+                        "workflow has stopped here."
+                    ),
+                )
+
+            if not verification.passed:
+                return WorkflowRunResult(
+                    status="VERIFICATION_FAILED",
+                    workflow_name=workflow.name,
+                    completed_steps=tuple(completed_steps),
+                    reason=(
+                        f"Step {step.subject!r} completed but did not "
+                        f"pass verification: {verification.reason}"
+                    ),
+                )
+
+            previous_result = loop_result
+
+        return WorkflowRunResult(
+            status="COMPLETED",
+            workflow_name=workflow.name,
+            completed_steps=tuple(completed_steps),
+            reason=None,
+        )
+
+    def _select_workflow(
+        self,
+        normalized: NormalizedTask,
+    ) -> WorkflowDefinition | None:
+        """
+        First registered WorkflowDefinition (in registration order)
+        whose `can_handle` matches `normalized`, or `None` if none do
+        -- mirrors _select_agent's own first-match-wins rule, applied
+        to workflows instead of agents.
+        """
+
+        for workflow in self._workflows:
+            if workflow.can_handle(normalized):
+                return workflow
+
+        return None
+
+    def _find_registration(self, subject: str) -> AgentRegistration:
+        """
+        The AgentRegistration for `subject`. Only ever called with a
+        subject a WorkflowStep names, which register_workflow() has
+        already verified matches a real registration -- so reaching
+        the RuntimeError below would mean this Kernel's own
+        `_registrations` changed shape after registration (not
+        possible through this class's public API today), not a
+        reachable user-facing error.
+        """
+
+        for registration in self._registrations:
+            if registration.subject == subject:
+                return registration
+
+        raise RuntimeError(
+            f"Internal error: workflow step names subject {subject!r}, "
+            "which has no matching AgentRegistration."
         )
 
     def _execute_once(
@@ -1109,19 +1628,9 @@ class Kernel:
         if evaluation.next_subject != self.independent_verifier.subject:
             return None
 
-        artifacts = getattr(last_result, "artifacts", None) or ()
+        path = extract_first_artifact_path(loop_result)
 
-        if not artifacts:
-            return None
-
-        first_artifact = artifacts[0]
-
-        if isinstance(first_artifact, dict):
-            path = first_artifact.get("path")
-        else:
-            path = getattr(first_artifact, "path", None)
-
-        if not isinstance(path, str) or not path.strip():
+        if path is None:
             return None
 
         verifier_agent = self.independent_verifier.build_agent()
