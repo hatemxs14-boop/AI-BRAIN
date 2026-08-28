@@ -34,6 +34,14 @@
       "approval": "policy"
     },
     {
+      "subject": "research_agent",
+      "resource": "project_memory",
+      "action": "read",
+      "scope": "workspace",
+      "risk_level": "LOW",
+      "approval": "none"
+    },
+    {
       "subject": "writer_agent",
       "resource": "research_findings",
       "action": "read",

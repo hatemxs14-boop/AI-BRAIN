@@ -29,6 +29,10 @@ from core.llm.llm_client import (
     LLMClient,
 )
 
+from core.memory.memory_store import (
+    MemoryStore,
+)
+
 from core.policies.policy_engine import (
     PolicyEngine,
 )
@@ -45,6 +49,12 @@ from core.tools.implementations.document_read_tool import (
     READ_DOCUMENT_TOOL,
     READ_DOCUMENT_TOOL_ID,
     create_document_read_executor,
+)
+
+from core.tools.implementations.read_project_memory_tool import (
+    READ_PROJECT_MEMORY_TOOL,
+    READ_PROJECT_MEMORY_TOOL_ID,
+    create_read_project_memory_executor,
 )
 
 from core.tools.implementations.web_search_tool import (
@@ -125,6 +135,21 @@ from core.tools.runtime.tool_runtime import (
 #                       that module's own docstring for why this is
 #                       the one tool here that is NOT auto-executing.
 #
+#   read_project_memory  resource=project_memory action=read
+#                        scope=workspace
+#                    -> core.tools.implementations.read_project_memory_tool
+#                       (real, keyword-search read access to the
+#                       Memory Layer -- Build Phase 14 -- closing the
+#                       "read approved project memory" capability
+#                       RESEARCH_AGENT.md's Memory Access section has
+#                       declared since this spec was first written,
+#                       with nothing implementing it until now)
+#                       LOW risk -- auto-executes, no approval
+#                       required. Its results are untrusted context,
+#                       never fed automatically into anything this
+#                       module builds; see that tool's own docstring
+#                       and core/memory/MEMORY_SPEC.md.
+#
 # Resolved contradiction: permissions.json used to also grant
 # research_agent a HIGH-risk permission for resource=shell/
 # action=execute/scope=workspace (present since Pass 1's test
@@ -177,6 +202,7 @@ RESEARCH_AGENT_SUBJECT = "research_agent"
 DEFAULT_PERMISSIONS_PATH = "core/security/schemas/permissions.json"
 DEFAULT_DOCUMENTS_ROOT = "workspace/research_documents"
 DEFAULT_FINDINGS_ROOT = "workspace/research_findings"
+DEFAULT_MEMORY_STORE_PATH = "workspace/project_memory/memory.jsonl"
 
 RESEARCH_AGENT_DECLARED_TOOL_IDS = frozenset(
     {
@@ -184,6 +210,7 @@ RESEARCH_AGENT_DECLARED_TOOL_IDS = frozenset(
         READ_DOCUMENT_TOOL_ID,
         READ_WEBPAGE_TOOL_ID,
         WRITE_RESEARCH_FINDINGS_TOOL_ID,
+        READ_PROJECT_MEMORY_TOOL_ID,
     }
 )
 
@@ -192,6 +219,7 @@ def build_research_agent(
     *,
     documents_root: str | Path = DEFAULT_DOCUMENTS_ROOT,
     findings_root: str | Path = DEFAULT_FINDINGS_ROOT,
+    memory_store_path: str | Path = DEFAULT_MEMORY_STORE_PATH,
     serper_api_key: str | None = None,
     permissions_path: str | Path = DEFAULT_PERMISSIONS_PATH,
     audit_log_path: str | None = None,
@@ -218,6 +246,15 @@ def build_research_agent(
     regardless of this path (see this module's own docstring); this
     only controls WHERE an approved write is allowed to land.
 
+    `memory_store_path` (Build Phase 14) is the JSON-Lines file backing
+    read_project_memory's MemoryStore -- defaults to
+    workspace/project_memory/memory.jsonl. Unlike documents_root/
+    findings_root, this path does not need to already exist:
+    MemoryStore creates its parent directory itself (mirrors
+    AuditLogger's own precedent), so a fresh deployment with no memory
+    recorded yet still builds successfully and simply returns no
+    search results until something writes to the store.
+
     `policy_engine` defaults to a fresh PolicyEngine() -- injected
     mainly for tests that want to substitute or inspect it (see this
     module's own docstring for the Agent Constraints check it performs
@@ -233,6 +270,7 @@ def build_research_agent(
     registry.register(READ_DOCUMENT_TOOL)
     registry.register(READ_WEBPAGE_TOOL)
     registry.register(WRITE_RESEARCH_FINDINGS_TOOL)
+    registry.register(READ_PROJECT_MEMORY_TOOL)
 
     scope_evaluation = policy_engine.evaluate_agent_scope(
         subject=RESEARCH_AGENT_SUBJECT,
@@ -322,6 +360,13 @@ def build_research_agent(
         ),
     )
 
+    gateway.register_executor(
+        tool_id=READ_PROJECT_MEMORY_TOOL_ID,
+        executor=create_read_project_memory_executor(
+            MemoryStore(str(memory_store_path)),
+        ),
+    )
+
     runtime = ToolRuntime(
         registry=registry,
         gateway=gateway,
@@ -355,6 +400,7 @@ def run_research_agent(
     decision_engine: AgentDecisionEngine | None = None,
     documents_root: str | Path = DEFAULT_DOCUMENTS_ROOT,
     findings_root: str | Path = DEFAULT_FINDINGS_ROOT,
+    memory_store_path: str | Path = DEFAULT_MEMORY_STORE_PATH,
     serper_api_key: str | None = None,
     permissions_path: str | Path = DEFAULT_PERMISSIONS_PATH,
     audit_log_path: str | None = None,
@@ -393,6 +439,7 @@ def run_research_agent(
     agent = build_research_agent(
         documents_root=documents_root,
         findings_root=findings_root,
+        memory_store_path=memory_store_path,
         serper_api_key=serper_api_key,
         permissions_path=permissions_path,
         audit_log_path=audit_log_path,

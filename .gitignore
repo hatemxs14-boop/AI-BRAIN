@@ -3,8 +3,12 @@
 __pycache__/
 *.py[cod]
 
-# Obsidian Vault
-memory/
+# Obsidian Vault (repo-root only -- anchored with a leading slash so
+# this does not also match core/memory/ or tests/memory/, the real
+# Memory Layer introduced in Build Phase 14; an unanchored "memory/"
+# matches a directory of that name at ANY depth, which silently
+# shadowed both of those from git entirely until this fix)
+/memory/
 
 # ECC is a separate Git repository
 ecc/

@@ -31,8 +31,11 @@ from core.kernel.kernel import (
     Kernel,
     KernelVerification,
     NormalizedTask,
+    RetrievedContext,
     WorkflowVerifierRegistration,
 )
+
+from core.memory.memory_store import MemoryEntry, MemoryStore
 
 from core.orchestration.orchestration_engine import (
     SequentialOrchestrationEngine,
@@ -1475,5 +1478,266 @@ def test_independent_verification_genuinely_delegates_to_the_injected_policy_eng
         assert independent_verification is not None
         assert independent_verification.status == "COMPLETED"
         assert verifier_build_count["n"] == 1
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------
+# Kernel._retrieve_context / KernelResult.retrieved_context
+# (Build Phase 14 -- see core/memory/MEMORY_SPEC.md and
+# core/kernel/kernel.py's own RetrievedContext docstring)
+# ---------------------------------------------------------------------
+
+def test_kernel_defaults_to_no_memory_store_and_retrieved_context_is_none():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        kernel = Kernel(orchestration_engine=SequentialOrchestrationEngine())
+        assert kernel.memory_store is None
+
+        kernel.register_agent(
+            AgentRegistration(
+                subject="test_agent",
+                description="Completes immediately.",
+                can_handle=lambda normalized: True,
+                build_agent=lambda: _build_zero_tool_agent(tmp_dir),
+                build_decision_engine=lambda: _ImmediateCompleteEngine(),
+            )
+        )
+
+        result = kernel.run("Do something trivial.")
+
+        assert result.status == "COMPLETED"
+        assert result.retrieved_context is None
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_kernel_rejects_a_non_memory_store():
+    with pytest.raises(TypeError, match="memory_store"):
+        Kernel(
+            orchestration_engine=SequentialOrchestrationEngine(),
+            memory_store="not a memory store",
+        )
+
+
+def test_kernel_rejects_non_integer_context_retrieval_limit():
+    with pytest.raises(TypeError, match="context_retrieval_limit"):
+        Kernel(
+            orchestration_engine=SequentialOrchestrationEngine(),
+            context_retrieval_limit="5",
+        )
+
+
+def test_kernel_rejects_non_positive_context_retrieval_limit():
+    with pytest.raises(ValueError, match="context_retrieval_limit"):
+        Kernel(
+            orchestration_engine=SequentialOrchestrationEngine(),
+            context_retrieval_limit=0,
+        )
+
+
+def test_retrieve_context_returns_real_matching_records_when_configured():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        store = MemoryStore(str(tmp_dir / "memory.jsonl"))
+        store.write(
+            MemoryEntry(
+                subject="research_agent",
+                kind="note",
+                content="The quarterly report is finished.",
+            )
+        )
+
+        kernel = Kernel(
+            orchestration_engine=SequentialOrchestrationEngine(),
+            memory_store=store,
+        )
+
+        kernel.register_agent(
+            AgentRegistration(
+                subject="test_agent",
+                description="Completes immediately.",
+                can_handle=lambda normalized: True,
+                build_agent=lambda: _build_zero_tool_agent(tmp_dir),
+                build_decision_engine=lambda: _ImmediateCompleteEngine(),
+            )
+        )
+
+        result = kernel.run("Please summarize the quarterly report.")
+
+        assert result.status == "COMPLETED"
+        assert result.retrieved_context is not None
+        assert isinstance(result.retrieved_context, RetrievedContext)
+        assert result.retrieved_context.query == (
+            "Please summarize the quarterly report."
+        )
+        assert len(result.retrieved_context.records) == 1
+        assert result.retrieved_context.records[0].content == (
+            "The quarterly report is finished."
+        )
+        assert result.retrieved_context.records[0].verified is False
+
+        # Untrusted-context guarantee: retrieval must never rewrite the
+        # task actually executed.
+        assert result.loop_result.context.task == (
+            "Please summarize the quarterly report."
+        )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_retrieve_context_returns_empty_records_when_nothing_matches():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        store = MemoryStore(str(tmp_dir / "memory.jsonl"))
+        store.write(
+            MemoryEntry(
+                subject="research_agent",
+                kind="note",
+                content="Completely unrelated content.",
+            )
+        )
+
+        kernel = Kernel(
+            orchestration_engine=SequentialOrchestrationEngine(),
+            memory_store=store,
+        )
+
+        kernel.register_agent(
+            AgentRegistration(
+                subject="test_agent",
+                description="Completes immediately.",
+                can_handle=lambda normalized: True,
+                build_agent=lambda: _build_zero_tool_agent(tmp_dir),
+                build_decision_engine=lambda: _ImmediateCompleteEngine(),
+            )
+        )
+
+        result = kernel.run("Something about quarterly reports.")
+
+        assert result.retrieved_context is not None
+        assert result.retrieved_context.records == ()
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_retrieve_context_is_populated_even_when_no_agent_matches():
+    """
+    CONTEXT RETRIEVAL happens before CLASSIFY in Kernel.run() (per
+    KERNEL_SPEC.md's own lifecycle ordering) -- retrieved_context
+    should still be real, inspectable data on a NO_AGENT_AVAILABLE
+    result, not silently dropped just because nothing matched.
+    """
+
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        store = MemoryStore(str(tmp_dir / "memory.jsonl"))
+        store.write(
+            MemoryEntry(
+                subject="research_agent",
+                kind="note",
+                content="A note about widgets.",
+            )
+        )
+
+        kernel = Kernel(
+            orchestration_engine=SequentialOrchestrationEngine(),
+            memory_store=store,
+        )
+
+        kernel.register_agent(
+            AgentRegistration(
+                subject="test_agent",
+                description="Never matches.",
+                can_handle=lambda normalized: False,
+                build_agent=lambda: None,
+                build_decision_engine=lambda: None,
+            )
+        )
+
+        result = kernel.run("Tell me about widgets.")
+
+        assert result.status == "NO_AGENT_AVAILABLE"
+        assert result.retrieved_context is not None
+        assert len(result.retrieved_context.records) == 1
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_retrieve_context_degrades_to_none_when_search_raises():
+    """
+    Genuine-delegation / fail-safe proof: _retrieve_context must
+    degrade to None (never raise, never fail an otherwise-real Kernel
+    run) when the configured memory_store's own search() raises --
+    the same tolerance _evaluate_policy/_trigger_independent_verification
+    already established for their own optional, additive steps.
+    """
+
+    class _AlwaysRaisingMemoryStore(MemoryStore):
+        def search(self, *args, **kwargs):
+            raise ValueError("simulated search failure")
+
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        kernel = Kernel(
+            orchestration_engine=SequentialOrchestrationEngine(),
+            memory_store=_AlwaysRaisingMemoryStore(
+                str(tmp_dir / "memory.jsonl")
+            ),
+        )
+
+        kernel.register_agent(
+            AgentRegistration(
+                subject="test_agent",
+                description="Completes immediately.",
+                can_handle=lambda normalized: True,
+                build_agent=lambda: _build_zero_tool_agent(tmp_dir),
+                build_decision_engine=lambda: _ImmediateCompleteEngine(),
+            )
+        )
+
+        result = kernel.run("Do something trivial.")
+
+        assert result.status == "COMPLETED"
+        assert result.retrieved_context is None
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_context_retrieval_limit_is_passed_through_to_search():
+    """
+    Genuine-delegation proof: Kernel.context_retrieval_limit must
+    actually reach MemoryStore.search()'s own `limit`, not be a
+    constructor argument nothing reads.
+    """
+
+    captured: dict[str, object] = {}
+
+    class _CapturingMemoryStore(MemoryStore):
+        def search(self, query, *, limit=10, **kwargs):
+            captured["limit"] = limit
+            return ()
+
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        kernel = Kernel(
+            orchestration_engine=SequentialOrchestrationEngine(),
+            memory_store=_CapturingMemoryStore(str(tmp_dir / "memory.jsonl")),
+            context_retrieval_limit=3,
+        )
+
+        kernel.register_agent(
+            AgentRegistration(
+                subject="test_agent",
+                description="Completes immediately.",
+                can_handle=lambda normalized: True,
+                build_agent=lambda: _build_zero_tool_agent(tmp_dir),
+                build_decision_engine=lambda: _ImmediateCompleteEngine(),
+            )
+        )
+
+        kernel.run("Do something trivial.")
+
+        assert captured["limit"] == 3
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)

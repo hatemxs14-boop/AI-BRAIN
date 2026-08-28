@@ -15,6 +15,11 @@ from core.agents.decision_engine import (
     AgentDecisionEngine,
 )
 
+from core.memory.memory_store import (
+    MemoryRecord,
+    MemoryStore,
+)
+
 from core.orchestration.engine_factory import (
     create_default_orchestration_engine,
 )
@@ -53,8 +58,31 @@ from core.policies.policy_engine import (
 #   NORMALIZE              real (_normalize)
 #   CLASSIFY               real (_classify) -- capability-predicate
 #                           matching against registered agents
-#   CONTEXT RETRIEVAL       no-op: no memory layer exists yet
-#                           (_retrieve_context)
+#   CONTEXT RETRIEVAL       real, but opt-in (_retrieve_context): as of
+#                           Build Phase 14, a real core.memory.
+#                           memory_store.MemoryStore now exists (see
+#                           core/memory/MEMORY_SPEC.md). When this
+#                           Kernel is configured with one (the
+#                           `memory_store` constructor argument,
+#                           default None), _retrieve_context runs a
+#                           real keyword search against it for every
+#                           task and surfaces the result as
+#                           KernelResult.retrieved_context -- purely
+#                           additive, inspectable diagnostic data, the
+#                           same shape Build Phase 7's
+#                           policy_evaluation and Build Phase 12's
+#                           independent_verification already
+#                           established. It is never woven into the
+#                           normalized task text or fed to the agent
+#                           automatically: POLICY_SPEC.md's Memory
+#                           Constraints ("recalled memory is untrusted
+#                           context") and this module's own Sec.3
+#                           ("must not treat memory as authoritative
+#                           without verification") both rule that out.
+#                           An unconfigured Kernel (memory_store=None,
+#                           the default) behaves exactly as it always
+#                           has -- this step is a no-op for every
+#                           existing caller that doesn't opt in.
 #   STRATEGY SELECTION      real but simple (_select_strategy) --
 #                           only "run one matching agent" exists
 #                           today; ranking multiple candidates is
@@ -138,7 +166,20 @@ from core.policies.policy_engine import (
 #   PERSIST                 delegated to the agent's own tools (e.g.
 #                           research_agent's write_research_findings,
 #                           Build Phase 3) -- the Kernel must not
-#                           "replace the memory layer" (Sec.3)
+#                           "replace the memory layer" (Sec.3). Build
+#                           Phase 14's new MemoryStore.write()/verify()
+#                           are real, callable operations, but no agent
+#                           specification in this project currently
+#                           declares a capability to write into project
+#                           memory (RESEARCH_AGENT.md explicitly
+#                           forbids research_agent from "promoting its
+#                           own findings directly into canonical
+#                           knowledge") -- so this step remains
+#                           delegated, not newly performed by the
+#                           Kernel itself, exactly per Sec.3. See
+#                           core/memory/MEMORY_SPEC.md's own v1 Scope
+#                           section for the honest list of what is and
+#                           isn't wired yet.
 #   EVALUATE                real (KernelResult carries status +
 #                           verification + the full AgentLoopResult),
 #                           and, as of Build Phase 7, also carries a
@@ -179,6 +220,34 @@ class NormalizedTask:
     """
 
     text: str
+
+
+@dataclass(frozen=True)
+class RetrievedContext:
+    """
+    Result of the Kernel's CONTEXT RETRIEVAL step (Build Phase 14),
+    when a memory_store is configured (see Kernel.__init__'s own
+    docstring). `records` is exactly what MemoryStore.search()
+    returned for `query` -- most-recent-first, each carrying its own
+    `verified` flag.
+
+    This is inspectable diagnostic data ONLY. Nothing in this project
+    reads `records` back into the normalized task, an agent's prompt,
+    or any other execution input -- POLICY_SPEC.md's Memory
+    Constraints ("recalled memory is untrusted context") and this
+    module's own Sec.3 ("must not treat memory as authoritative
+    without verification") both require that a recalled record never
+    silently become part of what an agent is told is true. A future
+    phase that wants an agent to actually consult memory during its
+    own reasoning should do so through a real tool call (e.g.
+    research_agent's read_project_memory), which passes through the
+    full Security Layer and leaves the calling agent's own decision
+    engine to decide what to do with the result -- not through this
+    Kernel-level field.
+    """
+
+    query: str
+    records: tuple[MemoryRecord, ...]
 
 
 @dataclass(frozen=True)
@@ -285,6 +354,12 @@ class KernelResult:
     would itself violate this project's standing constraint that the
     system must never become so strict it refuses to execute/accept
     something.
+
+    `retrieved_context` (Build Phase 14) is the CONTEXT RETRIEVAL
+    step's own result -- see RetrievedContext's own docstring for
+    exactly what it is (inspectable-only, untrusted, never fed back
+    into execution) and Kernel._retrieve_context's docstring for when
+    it is real vs. `None`.
     """
 
     status: str
@@ -295,6 +370,7 @@ class KernelResult:
     recovery_attempts: int = 0
     policy_evaluation: ExternalActionEvaluation | None = None
     independent_verification: AgentLoopResult | None = None
+    retrieved_context: RetrievedContext | None = None
 
 
 @dataclass(frozen=True)
@@ -400,8 +476,10 @@ class Kernel:
     - access the Security Layer directly (delegated to the same)
     - replace the orchestration layer (delegated to OrchestrationEngine)
     - replace specialized agents (delegated to registered agents)
-    - replace the memory layer (no memory layer exists yet; see this
-      module's own docstring)
+    - replace the memory layer (a real one now exists as of Build
+      Phase 14 -- core/memory/memory_store.py -- but the Kernel only
+      ever reads from it via _retrieve_context, opt-in and inspectable
+      only; see this module's own docstring)
     - silently resolve an approval requirement
 
     `max_recovery_attempts` bounds RECOVER IF NEEDED (see this
@@ -438,6 +516,22 @@ class Kernel:
     default_kernel.py) only configures it when a caller explicitly
     asks for it, so no existing caller's behavior, cost, or test counts
     change unless they opt in.
+
+    `memory_store` (Build Phase 14) is an optional
+    core.memory.memory_store.MemoryStore this Kernel may query during
+    CONTEXT RETRIEVAL (see _retrieve_context and RetrievedContext's
+    own docstrings). Defaults to `None`, in which case
+    _retrieve_context always returns `None` and
+    KernelResult.retrieved_context is always `None` -- the exact same
+    opt-in, additive shape `independent_verifier` already established
+    above: an unconfigured Kernel behaves exactly as it did before
+    Build Phase 14.
+
+    `context_retrieval_limit` bounds how many memory records a single
+    CONTEXT RETRIEVAL query may return (passed straight through to
+    MemoryStore.search()'s own `limit`). Defaults to 5 -- enough to be
+    useful without one task's retrieval becoming unbounded; only
+    meaningful when `memory_store` is configured.
     """
 
     def __init__(
@@ -447,6 +541,8 @@ class Kernel:
         max_recovery_attempts: int = 1,
         policy_engine: PolicyEngine | None = None,
         independent_verifier: WorkflowVerifierRegistration | None = None,
+        memory_store: MemoryStore | None = None,
+        context_retrieval_limit: int = 5,
     ) -> None:
 
         if not isinstance(max_recovery_attempts, int):
@@ -482,6 +578,24 @@ class Kernel:
             )
 
         self.independent_verifier = independent_verifier
+
+        if memory_store is not None and not isinstance(
+            memory_store, MemoryStore
+        ):
+            raise TypeError(
+                "memory_store must be a MemoryStore or None."
+            )
+
+        if not isinstance(context_retrieval_limit, int):
+            raise TypeError("context_retrieval_limit must be an integer.")
+
+        if context_retrieval_limit <= 0:
+            raise ValueError(
+                "context_retrieval_limit must be a positive integer."
+            )
+
+        self.memory_store = memory_store
+        self.context_retrieval_limit = context_retrieval_limit
 
     def register_agent(
         self,
@@ -521,7 +635,7 @@ class Kernel:
 
         normalized = self._normalize(task)
 
-        self._retrieve_context(normalized)
+        retrieved_context = self._retrieve_context(normalized)
 
         classification = self._classify(normalized)
 
@@ -535,6 +649,7 @@ class Kernel:
                     "No registered agent's can_handle predicate "
                     "matched this task."
                 ),
+                retrieved_context=retrieved_context,
             )
 
         registration = self._select_agent(
@@ -583,6 +698,7 @@ class Kernel:
             recovery_attempts=recovery_attempts,
             policy_evaluation=policy_evaluation,
             independent_verification=independent_verification,
+            retrieved_context=retrieved_context,
         )
 
     def _execute_once(
@@ -640,16 +756,43 @@ class Kernel:
     def _retrieve_context(
         self,
         normalized: NormalizedTask,
-    ) -> None:
+    ) -> RetrievedContext | None:
         """
-        CONTEXT RETRIEVAL. Explicit no-op: no memory layer exists in
-        this project yet (POLICY_SPEC.md's Memory Constraints section
-        describes one, `core/` does not implement one). This method
-        exists so a real memory lookup has an obvious, single place
-        to be added later without restructuring `run()`.
+        CONTEXT RETRIEVAL. Real when `self.memory_store` is configured
+        (Build Phase 14): runs a real MemoryStore.search() for the
+        normalized task text and returns the result as a
+        RetrievedContext -- see that dataclass's own docstring for why
+        this is inspectable-only and never fed back into `normalized`
+        or any later step of this same `run()` call.
+
+        Returns `None` in two cases, never raises for either (the same
+        "degrade rather than fail an otherwise-real Kernel result over
+        an optional, additive step" tolerance _evaluate_policy and
+        _trigger_independent_verification already established -- see
+        their own docstrings):
+
+          - no `memory_store` is configured on this Kernel (the
+            default -- see Kernel.__init__'s own docstring for why an
+            unconfigured Kernel must behave exactly as it did before
+            Build Phase 14)
+          - MemoryStore.search() itself raises (e.g. ValueError for an
+            empty query -- not reachable through _normalize's own
+            non-empty guarantee today, but this method does not rely
+            on that guarantee holding forever)
         """
 
-        return None
+        if self.memory_store is None:
+            return None
+
+        try:
+            records = self.memory_store.search(
+                normalized.text,
+                limit=self.context_retrieval_limit,
+            )
+        except ValueError:
+            return None
+
+        return RetrievedContext(query=normalized.text, records=records)
 
     def _classify(
         self,

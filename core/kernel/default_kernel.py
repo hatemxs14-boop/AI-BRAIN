@@ -15,6 +15,7 @@ from core.agents.llm_decision_engine import (
 from core.agents.research_agent import (
     DEFAULT_DOCUMENTS_ROOT,
     DEFAULT_FINDINGS_ROOT,
+    DEFAULT_MEMORY_STORE_PATH,
     DEFAULT_PERMISSIONS_PATH,
     build_research_agent,
 )
@@ -37,6 +38,10 @@ from core.kernel.kernel import (
 
 from core.llm.llm_client import (
     LLMClient,
+)
+
+from core.memory.memory_store import (
+    MemoryStore,
 )
 
 from core.orchestration.orchestration_engine import (
@@ -220,6 +225,7 @@ def build_default_kernel(
     documents_root: str | Path = DEFAULT_DOCUMENTS_ROOT,
     findings_root: str | Path = DEFAULT_FINDINGS_ROOT,
     reports_root: str | Path = DEFAULT_REPORTS_ROOT,
+    memory_store_path: str | Path = DEFAULT_MEMORY_STORE_PATH,
     serper_api_key: str | None = None,
     permissions_path: str | Path = DEFAULT_PERMISSIONS_PATH,
     audit_log_path: str | None = None,
@@ -230,6 +236,7 @@ def build_default_kernel(
     max_recovery_attempts: int = 1,
     policy_engine: PolicyEngine | None = None,
     enable_independent_verification: bool = False,
+    enable_memory_retrieval: bool = False,
 ) -> Kernel:
     """
     Build a Kernel with research_agent, writer_agent, and
@@ -283,6 +290,25 @@ def build_default_kernel(
     engine run, potentially an extra LLM call in production), and
     every existing caller's test counts are completely unchanged unless
     a caller explicitly opts in.
+
+    `memory_store_path` (Build Phase 14) is passed straight through to
+    build_research_agent() -- see that function's own docstring --
+    regardless of `enable_memory_retrieval` below, since research_agent's
+    read_project_memory tool is always wired (it is a real, spec-
+    declared, LOW-risk read tool, exactly like web_search/read_document/
+    read_webpage; see core/agents/research_agent.py's own docstring).
+
+    `enable_memory_retrieval` (Build Phase 14, default False) opts into
+    Kernel's own CONTEXT RETRIEVAL step being real: when True, this
+    Kernel is built with a real MemoryStore (backed by
+    `memory_store_path`) as its `memory_store`, so every `Kernel.run()`
+    call performs a real keyword search and surfaces the result on
+    KernelResult.retrieved_context -- see Kernel.__init__'s and
+    RetrievedContext's own docstrings (core/kernel/kernel.py) for
+    exactly what this is (inspectable-only, never fed back into
+    execution) and why it defaults to False for the same "no existing
+    caller's behavior or test counts change unless they opt in" reason
+    `enable_independent_verification` already established above.
     """
 
     if decision_engine_factory is None:
@@ -315,6 +341,7 @@ def build_default_kernel(
         return build_research_agent(
             documents_root=documents_root,
             findings_root=findings_root,
+            memory_store_path=memory_store_path,
             serper_api_key=serper_api_key,
             permissions_path=permissions_path,
             audit_log_path=audit_log_path,
@@ -346,11 +373,18 @@ def build_default_kernel(
         else None
     )
 
+    memory_store = (
+        MemoryStore(str(memory_store_path))
+        if enable_memory_retrieval
+        else None
+    )
+
     kernel = Kernel(
         orchestration_engine=orchestration_engine,
         max_recovery_attempts=max_recovery_attempts,
         policy_engine=policy_engine,
         independent_verifier=independent_verifier,
+        memory_store=memory_store,
     )
 
     kernel.register_agent(

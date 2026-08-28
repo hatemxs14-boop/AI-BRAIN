@@ -223,13 +223,38 @@ from core.security.engine.security_decision import (
 #                           candidates, parallel execution, arbitrary
 #                           chains) remains future work.
 #
-# NOT IMPLEMENTED (documented, not fabricated):
-#
-#   MEMORY CONSTRAINTS       No memory layer exists in this project
-#                           (see Kernel v1's CONTEXT RETRIEVAL/PERSIST/
-#                           LEARN no-ops) -- there is nothing yet for
-#                           "recalled memory is untrusted context" or
-#                           "secrets must never be stored" to apply to.
+#   MEMORY CONSTRAINTS       real as of Build Phase 14, but enforced
+#                           structurally rather than through a
+#                           PolicyEngine method -- there is no case
+#                           anywhere in this project (yet) where a
+#                           caller hands PolicyEngine a piece of memory
+#                           data to evaluate, so adding a method here
+#                           with nothing to call it would be exactly
+#                           the "fabricate to look complete"
+#                           anti-pattern this module's docstring
+#                           already avoids elsewhere. Instead:
+#                           "secrets ... must never be stored" is
+#                           enforced at the point of write
+#                           (core.memory.memory_store.MemoryStore.write()
+#                           rejects content matching a known secret
+#                           shape -- see that module's own docstring);
+#                           "recalled memory is untrusted context" /
+#                           "must not be treated as an authority by
+#                           default" is enforced by construction (every
+#                           MemoryRecord carries its own `verified`
+#                           flag, and neither Kernel._retrieve_context
+#                           nor read_project_memory_tool ever feeds a
+#                           retrieved record back into execution as if
+#                           it were fact -- see core/kernel/kernel.py's
+#                           RetrievedContext docstring and
+#                           core/memory/MEMORY_SPEC.md's own Trust
+#                           Model section); "must be verified before
+#                           becoming canonical" is a real, callable
+#                           operation (MemoryStore.verify()), though
+#                           nothing in this project yet decides *when*
+#                           to call it automatically -- see
+#                           MEMORY_SPEC.md's own v1 Scope for that
+#                           honestly-named remaining gap.
 #   CORE RULES               This section's eight principles are
 #                           already satisfied as observable behavior by
 #                           the existing, hardened stack (fail-closed

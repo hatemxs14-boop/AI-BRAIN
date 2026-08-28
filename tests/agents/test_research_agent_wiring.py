@@ -258,18 +258,38 @@ def _make_findings_root() -> str:
     return tempfile.mkdtemp()
 
 
+def _make_memory_store_dir() -> str:
+    """
+    An isolated, per-test directory to hold a memory.jsonl (Build
+    Phase 14) -- same isolation discipline as
+    _make_documents_root()/_make_findings_root() above, so no test in
+    this file ever touches the real workspace/project_memory/
+    memory.jsonl the default build wires research_agent to in
+    production. Returns the directory (not the file path) so callers
+    can shutil.rmtree it in a `finally` block exactly like every other
+    tmp resource in this file.
+    """
+    return tempfile.mkdtemp()
+
+
+def _memory_store_path(memory_dir: str) -> str:
+    return str(Path(memory_dir) / "memory.jsonl")
+
+
 # ---------------------------------------------------------------------
 # build_research_agent(): tool discovery and configuration errors
 # ---------------------------------------------------------------------
 
-def test_build_research_agent_exposes_exactly_the_four_wired_tools():
+def test_build_research_agent_exposes_exactly_the_five_wired_tools():
     docs_root = _make_documents_root()
     findings_root = _make_findings_root()
+    memory_dir = _make_memory_store_dir()
     audit_dir = tempfile.mkdtemp()
     try:
         agent = build_research_agent(
             documents_root=docs_root,
             findings_root=findings_root,
+            memory_store_path=_memory_store_path(memory_dir),
             serper_api_key="test-key",
             audit_log_path=os.path.join(audit_dir, "audit.jsonl"),
         )
@@ -283,11 +303,13 @@ def test_build_research_agent_exposes_exactly_the_four_wired_tools():
             "read_document",
             "read_webpage",
             "write_research_findings",
+            "read_project_memory",
         }
         assert "shell" not in tool_ids
     finally:
         shutil.rmtree(docs_root)
         shutil.rmtree(findings_root)
+        shutil.rmtree(memory_dir)
         shutil.rmtree(audit_dir)
 
 
@@ -366,6 +388,7 @@ def test_build_research_agent_raises_when_policy_engine_reports_misaligned_permi
 
 def test_run_research_agent_completes_a_web_search_task():
     docs_root = _make_documents_root()
+    memory_dir = _make_memory_store_dir()
     audit_dir = tempfile.mkdtemp()
     try:
         organic = [
@@ -388,6 +411,7 @@ def test_run_research_agent_completes_a_web_search_task():
                 "Research AI agent frameworks.",
                 decision_engine=DeterministicDecisionEngine(),
                 documents_root=docs_root,
+                memory_store_path=_memory_store_path(memory_dir),
                 serper_api_key="test-key",
                 audit_log_path=os.path.join(audit_dir, "audit.jsonl"),
                 max_steps=3,
@@ -401,17 +425,20 @@ def test_run_research_agent_completes_a_web_search_task():
         assert artifact["results"][0]["title"] == "AI Agents Explained"
     finally:
         shutil.rmtree(docs_root)
+        shutil.rmtree(memory_dir)
         shutil.rmtree(audit_dir)
 
 
 def test_run_research_agent_completes_a_read_document_task():
     docs_root = _make_documents_root()
+    memory_dir = _make_memory_store_dir()
     audit_dir = tempfile.mkdtemp()
     try:
         result = run_research_agent(
             "Summarize sample.txt.",
             decision_engine=_ReadDocumentThenCompleteEngine("sample.txt"),
             documents_root=docs_root,
+            memory_store_path=_memory_store_path(memory_dir),
             serper_api_key="unused-but-required-key",
             audit_log_path=os.path.join(audit_dir, "audit.jsonl"),
             max_steps=3,
@@ -425,11 +452,13 @@ def test_run_research_agent_completes_a_read_document_task():
         assert artifact["content"] == "The sky is blue."
     finally:
         shutil.rmtree(docs_root)
+        shutil.rmtree(memory_dir)
         shutil.rmtree(audit_dir)
 
 
 def test_run_research_agent_completes_a_read_webpage_task():
     docs_root = _make_documents_root()
+    memory_dir = _make_memory_store_dir()
     audit_dir = tempfile.mkdtemp()
     try:
         html = (
@@ -450,6 +479,7 @@ def test_run_research_agent_completes_a_read_webpage_task():
                     "https://example.com/evidence"
                 ),
                 documents_root=docs_root,
+                memory_store_path=_memory_store_path(memory_dir),
                 serper_api_key="unused-but-required-key",
                 audit_log_path=os.path.join(audit_dir, "audit.jsonl"),
                 max_steps=3,
@@ -464,6 +494,7 @@ def test_run_research_agent_completes_a_read_webpage_task():
         assert "The sky is blue." in artifact["content"]
     finally:
         shutil.rmtree(docs_root)
+        shutil.rmtree(memory_dir)
         shutil.rmtree(audit_dir)
 
 
@@ -478,6 +509,7 @@ def test_run_research_agent_pauses_for_approval_when_writing_findings():
     """
     docs_root = _make_documents_root()
     findings_root = _make_findings_root()
+    memory_dir = _make_memory_store_dir()
     audit_dir = tempfile.mkdtemp()
     try:
         result = run_research_agent(
@@ -487,6 +519,7 @@ def test_run_research_agent_pauses_for_approval_when_writing_findings():
             ),
             documents_root=docs_root,
             findings_root=findings_root,
+            memory_store_path=_memory_store_path(memory_dir),
             serper_api_key="unused-but-required-key",
             audit_log_path=os.path.join(audit_dir, "audit.jsonl"),
             max_steps=3,
@@ -497,12 +530,14 @@ def test_run_research_agent_pauses_for_approval_when_writing_findings():
     finally:
         shutil.rmtree(docs_root)
         shutil.rmtree(findings_root)
+        shutil.rmtree(memory_dir)
         shutil.rmtree(audit_dir)
 
 
 def test_run_research_agent_completes_a_write_research_findings_task():
     docs_root = _make_documents_root()
     findings_root = _make_findings_root()
+    memory_dir = _make_memory_store_dir()
     audit_dir = tempfile.mkdtemp()
     try:
         result = run_research_agent(
@@ -513,6 +548,7 @@ def test_run_research_agent_completes_a_write_research_findings_task():
             ),
             documents_root=docs_root,
             findings_root=findings_root,
+            memory_store_path=_memory_store_path(memory_dir),
             serper_api_key="unused-but-required-key",
             audit_log_path=os.path.join(audit_dir, "audit.jsonl"),
             max_steps=3,
@@ -533,6 +569,7 @@ def test_run_research_agent_completes_a_write_research_findings_task():
     finally:
         shutil.rmtree(docs_root)
         shutil.rmtree(findings_root)
+        shutil.rmtree(memory_dir)
         shutil.rmtree(audit_dir)
 
 
@@ -567,12 +604,14 @@ def test_shell_permission_grants_nothing_because_no_tool_is_registered():
     any executor.
     """
     docs_root = _make_documents_root()
+    memory_dir = _make_memory_store_dir()
     audit_dir = tempfile.mkdtemp()
     try:
         result = run_research_agent(
             "Try to run a shell command.",
             decision_engine=_RequestUnavailableShellEngine(),
             documents_root=docs_root,
+            memory_store_path=_memory_store_path(memory_dir),
             serper_api_key="test-key",
             audit_log_path=os.path.join(audit_dir, "audit.jsonl"),
             max_steps=3,
@@ -585,4 +624,5 @@ def test_shell_permission_grants_nothing_because_no_tool_is_registered():
         assert result.last_result is None
     finally:
         shutil.rmtree(docs_root)
+        shutil.rmtree(memory_dir)
         shutil.rmtree(audit_dir)
