@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from .approval_gate import (
     ApprovalDecision,
@@ -40,9 +41,56 @@ class SecurityDecisionPoint:
     5. Produces the final security decision.
     6. Records the complete decision in the audit log.
 
+    A caller that goes on to actually attempt the operation this
+    decision authorized (the Tool Gateway, after `evaluate()`/
+    `evaluate_with_approval()` returns ALLOW/ALLOW_WITH_CONTROLS) is
+    expected to report back what happened via
+    `record_execution_outcome()`, so the audit trail captures not
+    just what was decided but what actually occurred -- see that
+    method's own docstring.
+
     Approval never grants permission.
     Authorization must succeed before an approval can result in ALLOW.
     """
+
+    # SECURITY_SPEC.md's "Audit Logging" section requires the audit
+    # trail to distinguish between exactly these five outcomes, "so
+    # the system can determine whether an operation was merely
+    # requested or actually executed." This maps every real
+    # ToolExecutionResult.status (core/tools/engine/tool_gateway.py)
+    # onto that spec vocabulary -- see record_execution_outcome()'s
+    # own docstring for why this mapping is a second, distinct audit
+    # event rather than a field folded into the existing one.
+    #
+    #   SUCCESS           -> executed  (the private executor ran and
+    #                        its output passed validation)
+    #   DENIED             -> blocked   (the Security Layer, risk-
+    #                        consistency check, or registry/executor
+    #                        lookup stopped it before it could run)
+    #   APPROVAL_REQUIRED  -> requested (submitted, but still waiting
+    #                        on a human decision -- neither executed
+    #                        nor blocked yet)
+    #   INVALID_INPUT      -> failed    (the request itself was
+    #                        malformed; the private executor was
+    #                        never even reached)
+    #   INVALID_OUTPUT     -> failed    (the executor DID run, but its
+    #                        output could not be trusted)
+    #   ERROR              -> failed    (the executor ran and raised)
+    #
+    # Any tool_status this table doesn't recognize degrades to
+    # "failed" rather than raising -- this method records a fact
+    # about a tool call that has *already happened*; it must never be
+    # the reason that call's own result fails to be returned to its
+    # caller (the standing "never so strict it refuses to execute or
+    # accept something" constraint applies to audit bookkeeping too).
+    _EXECUTION_STATUS_BY_TOOL_STATUS: dict[str, str] = {
+        "SUCCESS": "executed",
+        "DENIED": "blocked",
+        "APPROVAL_REQUIRED": "requested",
+        "INVALID_INPUT": "failed",
+        "INVALID_OUTPUT": "failed",
+        "ERROR": "failed",
+    }
 
     def __init__(
         self,
@@ -127,6 +175,90 @@ class SecurityDecisionPoint:
             approved_by=approved_by,
             metadata=metadata,
         )
+
+    def record_execution_outcome(
+        self,
+        *,
+        security_decision: SecurityDecision,
+        tool_id: str,
+        tool_status: str,
+        summary: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """
+        Record what actually happened after a security decision was
+        made, as a second, distinct audit event.
+
+        `_evaluate()` already records one audit event per call, at
+        the moment the security *decision* is made -- but that event
+        is written BEFORE the Tool Gateway attempts to execute
+        anything. An ALLOW decision was previously audited identically
+        whether the private executor then actually ran successfully,
+        crashed, produced output that failed validation, or never got
+        a chance to run at all because the tool wasn't registered or
+        had no executor -- SECURITY_SPEC.md's Audit Logging section
+        names exactly this gap: "Audit records must distinguish
+        between: requested / authorized / executed / blocked /
+        failed. This allows the system to determine whether an
+        operation was merely requested or actually executed."
+
+        This is deliberately a SECOND event rather than a field
+        appended after the fact to the first one: audit records must
+        be append-only (AuditLogger never rewrites a line once
+        written), and the first event is what "was this operation
+        even authorized" answers on its own -- conflating the two
+        would lose the ability to tell, from the first record alone,
+        that a decision was made at all before its outcome was known.
+
+        `security_decision` supplies subject/resource/action/scope by
+        reading `security_decision.authorization.request` -- the same
+        AuthorizationRequest the original decision was made from --
+        rather than accepting them as separate parameters that could
+        drift from what was actually evaluated.
+
+        `tool_status` is the real ToolExecutionResult.status
+        (core/tools/engine/tool_gateway.py); it is translated to the
+        spec's five-term vocabulary via
+        `_EXECUTION_STATUS_BY_TOOL_STATUS` and recorded as
+        `execution_status`, alongside the raw `tool_status` itself so
+        neither the original detail nor the spec-level category is
+        lost.
+
+        `metadata` mirrors `evaluate()`/`evaluate_with_approval()`'s
+        own `metadata` parameter -- passing the same caller-supplied
+        value here lets both audit events for one tool call be
+        correlated without relying on timestamp proximity.
+        """
+
+        if not isinstance(tool_id, str) or not tool_id.strip():
+            raise ValueError("tool_id must be a non-empty string.")
+
+        if not isinstance(tool_status, str) or not tool_status.strip():
+            raise ValueError("tool_status must be a non-empty string.")
+
+        request = security_decision.authorization.request
+
+        execution_status = self._EXECUTION_STATUS_BY_TOOL_STATUS.get(
+            tool_status, "failed"
+        )
+
+        audit_event = {
+            "event": "execution_outcome",
+            "subject": request.subject,
+            "resource": request.resource,
+            "action": request.action,
+            "scope": request.scope,
+            "tool_id": tool_id,
+            "decision": security_decision.decision.value,
+            "tool_status": tool_status,
+            "execution_status": execution_status,
+            "summary": summary,
+        }
+
+        if metadata is not None:
+            audit_event["metadata"] = metadata
+
+        self.audit_logger.record(audit_event)
 
     def _evaluate(
         self,

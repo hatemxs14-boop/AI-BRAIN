@@ -180,6 +180,16 @@ class ToolGateway:
             Output Validation
                 ↓
             Final Result
+
+        Every return path -- whatever stage it stops at -- funnels
+        through `_finalize()` exactly once, which reports the real
+        outcome back to the Security Layer's audit trail via
+        `SecurityDecisionPoint.record_execution_outcome()` before
+        handing the result back to the caller. See that method's own
+        docstring for why this exists: previously only the security
+        *decision* was audited, never whether the operation it
+        authorized actually executed, failed, or never got the
+        chance to run at all.
         """
 
         # ---------------------------------------------------------
@@ -190,24 +200,27 @@ class ToolGateway:
             tool: ToolDefinition = self.registry.get(tool_id)
 
         except (KeyError, TypeError) as exc:
-            return ToolExecutionResult(
-                status="DENIED",
-                summary="Tool is not registered in the Tool Registry.",
-                next_actions=(
-                    "Do not execute the tool.",
-                    "Register the tool before requesting execution.",
-                ),
-                artifacts=(str(exc),),
-                security_decision=self._unknown_tool_security_decision(
+            return self._finalize(
+                ToolExecutionResult(
+                    status="DENIED",
+                    summary="Tool is not registered in the Tool Registry.",
+                    next_actions=(
+                        "Do not execute the tool.",
+                        "Register the tool before requesting execution.",
+                    ),
+                    artifacts=(str(exc),),
+                    security_decision=self._unknown_tool_security_decision(
+                        subject=subject,
+                        tool_id=tool_id,
+                    ),
                     subject=subject,
                     tool_id=tool_id,
+                    # No ToolDefinition was ever resolved for this tool_id
+                    # -- there is no real registered action to report, so
+                    # this uses the same "execute" default as
+                    # _unknown_tool_security_decision below.
                 ),
-                subject=subject,
-                tool_id=tool_id,
-                # No ToolDefinition was ever resolved for this tool_id
-                # -- there is no real registered action to report, so
-                # this uses the same "execute" default as
-                # _unknown_tool_security_decision below.
+                metadata=metadata,
             )
 
         # ---------------------------------------------------------
@@ -219,23 +232,26 @@ class ToolGateway:
         executor = self._executors.get(tool_id)
 
         if executor is None:
-            return ToolExecutionResult(
-                status="DENIED",
-                summary="Tool has no registered private executor.",
-                next_actions=(
-                    "Do not execute the tool.",
-                    "Register the tool executor with the Tool Gateway.",
-                ),
-                artifacts=(
-                    f"No private executor registered for '{tool_id}'.",
-                ),
-                security_decision=self._security_for_registered_tool(
+            return self._finalize(
+                ToolExecutionResult(
+                    status="DENIED",
+                    summary="Tool has no registered private executor.",
+                    next_actions=(
+                        "Do not execute the tool.",
+                        "Register the tool executor with the Tool Gateway.",
+                    ),
+                    artifacts=(
+                        f"No private executor registered for '{tool_id}'.",
+                    ),
+                    security_decision=self._security_for_registered_tool(
+                        subject=subject,
+                        tool=tool,
+                    ),
                     subject=subject,
-                    tool=tool,
+                    tool_id=tool_id,
+                    action=tool.action,
                 ),
-                subject=subject,
-                tool_id=tool_id,
-                action=tool.action,
+                metadata=metadata,
             )
 
         # ---------------------------------------------------------
@@ -246,22 +262,25 @@ class ToolGateway:
             tool_kwargs = {}
 
         if not isinstance(tool_kwargs, dict):
-            return ToolExecutionResult(
-                status="INVALID_INPUT",
-                summary="Tool input validation failed.",
-                next_actions=(
-                    "Do not execute the tool.",
-                    "Provide tool inputs as a dictionary.",
-                    "Re-submit the request after validation succeeds.",
-                ),
-                artifacts=("tool_kwargs must be a dictionary.",),
-                security_decision=self._security_for_registered_tool(
+            return self._finalize(
+                ToolExecutionResult(
+                    status="INVALID_INPUT",
+                    summary="Tool input validation failed.",
+                    next_actions=(
+                        "Do not execute the tool.",
+                        "Provide tool inputs as a dictionary.",
+                        "Re-submit the request after validation succeeds.",
+                    ),
+                    artifacts=("tool_kwargs must be a dictionary.",),
+                    security_decision=self._security_for_registered_tool(
+                        subject=subject,
+                        tool=tool,
+                    ),
                     subject=subject,
-                    tool=tool,
+                    tool_id=tool_id,
+                    action=tool.action,
                 ),
-                subject=subject,
-                tool_id=tool_id,
-                action=tool.action,
+                metadata=metadata,
             )
 
         # ---------------------------------------------------------
@@ -276,22 +295,25 @@ class ToolGateway:
         )
 
         if not validation.valid:
-            return ToolExecutionResult(
-                status="INVALID_INPUT",
-                summary=validation.summary,
-                next_actions=(
-                    "Do not execute the tool.",
-                    "Correct the tool inputs.",
-                    "Re-submit the request after validation succeeds.",
-                ),
-                artifacts=validation.errors,
-                security_decision=self._security_for_registered_tool(
+            return self._finalize(
+                ToolExecutionResult(
+                    status="INVALID_INPUT",
+                    summary=validation.summary,
+                    next_actions=(
+                        "Do not execute the tool.",
+                        "Correct the tool inputs.",
+                        "Re-submit the request after validation succeeds.",
+                    ),
+                    artifacts=validation.errors,
+                    security_decision=self._security_for_registered_tool(
+                        subject=subject,
+                        tool=tool,
+                    ),
                     subject=subject,
-                    tool=tool,
+                    tool_id=tool_id,
+                    action=tool.action,
                 ),
-                subject=subject,
-                tool_id=tool_id,
-                action=tool.action,
+                metadata=metadata,
             )
 
         # ---------------------------------------------------------
@@ -347,25 +369,28 @@ class ToolGateway:
             registered_risk=registered_risk,
             assessed_risk=assessed_risk,
         ):
-            return ToolExecutionResult(
-                status="DENIED",
-                summary=(
-                    "Tool risk contract is inconsistent with "
-                    "the Security Layer assessment."
+            return self._finalize(
+                ToolExecutionResult(
+                    status="DENIED",
+                    summary=(
+                        "Tool risk contract is inconsistent with "
+                        "the Security Layer assessment."
+                    ),
+                    next_actions=(
+                        "Do not execute the tool.",
+                        "Review the registered tool risk level.",
+                        "Review the Security Layer risk assessment.",
+                    ),
+                    artifacts=(
+                        f"registered_risk={registered_risk}",
+                        f"assessed_risk={assessed_risk}",
+                    ),
+                    security_decision=security_decision,
+                    subject=subject,
+                    tool_id=tool_id,
+                    action=action,
                 ),
-                next_actions=(
-                    "Do not execute the tool.",
-                    "Review the registered tool risk level.",
-                    "Review the Security Layer risk assessment.",
-                ),
-                artifacts=(
-                    f"registered_risk={registered_risk}",
-                    f"assessed_risk={assessed_risk}",
-                ),
-                security_decision=security_decision,
-                subject=subject,
-                tool_id=tool_id,
-                action=action,
+                metadata=metadata,
             )
 
         # ---------------------------------------------------------
@@ -373,18 +398,21 @@ class ToolGateway:
         # ---------------------------------------------------------
 
         if security_decision.decision == Decision.DENY:
-            return ToolExecutionResult(
-                status="DENIED",
-                summary="Tool execution denied by the Security Layer.",
-                next_actions=(
-                    "Do not execute the tool.",
-                    "Review the authorization and security decision.",
+            return self._finalize(
+                ToolExecutionResult(
+                    status="DENIED",
+                    summary="Tool execution denied by the Security Layer.",
+                    next_actions=(
+                        "Do not execute the tool.",
+                        "Review the authorization and security decision.",
+                    ),
+                    artifacts=(),
+                    security_decision=security_decision,
+                    subject=subject,
+                    tool_id=tool_id,
+                    action=action,
                 ),
-                artifacts=(),
-                security_decision=security_decision,
-                subject=subject,
-                tool_id=tool_id,
-                action=action,
+                metadata=metadata,
             )
 
         # ---------------------------------------------------------
@@ -392,18 +420,21 @@ class ToolGateway:
         # ---------------------------------------------------------
 
         if security_decision.decision == Decision.REQUIRE_APPROVAL:
-            return ToolExecutionResult(
-                status="APPROVAL_REQUIRED",
-                summary="Tool execution requires additional approval.",
-                next_actions=(
-                    "Obtain the required approval.",
-                    "Re-submit the request with the explicit approval result.",
+            return self._finalize(
+                ToolExecutionResult(
+                    status="APPROVAL_REQUIRED",
+                    summary="Tool execution requires additional approval.",
+                    next_actions=(
+                        "Obtain the required approval.",
+                        "Re-submit the request with the explicit approval result.",
+                    ),
+                    artifacts=(),
+                    security_decision=security_decision,
+                    subject=subject,
+                    tool_id=tool_id,
+                    action=action,
                 ),
-                artifacts=(),
-                security_decision=security_decision,
-                subject=subject,
-                tool_id=tool_id,
-                action=action,
+                metadata=metadata,
             )
 
         # ---------------------------------------------------------
@@ -423,18 +454,21 @@ class ToolGateway:
             Decision.ALLOW,
             Decision.ALLOW_WITH_CONTROLS,
         ):
-            return ToolExecutionResult(
-                status="DENIED",
-                summary="Unknown security decision; execution blocked.",
-                next_actions=(
-                    "Inspect the Security Layer decision.",
-                    "Fail closed.",
+            return self._finalize(
+                ToolExecutionResult(
+                    status="DENIED",
+                    summary="Unknown security decision; execution blocked.",
+                    next_actions=(
+                        "Inspect the Security Layer decision.",
+                        "Fail closed.",
+                    ),
+                    artifacts=(),
+                    security_decision=security_decision,
+                    subject=subject,
+                    tool_id=tool_id,
+                    action=action,
                 ),
-                artifacts=(),
-                security_decision=security_decision,
-                subject=subject,
-                tool_id=tool_id,
-                action=action,
+                metadata=metadata,
             )
 
         # ---------------------------------------------------------
@@ -454,18 +488,21 @@ class ToolGateway:
             output = executor(**tool_kwargs)
 
         except Exception as exc:
-            return ToolExecutionResult(
-                status="ERROR",
-                summary="Authorized tool execution failed.",
-                next_actions=(
-                    "Inspect the tool execution error.",
-                    "Do not silently retry an unknown failure.",
+            return self._finalize(
+                ToolExecutionResult(
+                    status="ERROR",
+                    summary="Authorized tool execution failed.",
+                    next_actions=(
+                        "Inspect the tool execution error.",
+                        "Do not silently retry an unknown failure.",
+                    ),
+                    artifacts=(str(exc),),
+                    security_decision=security_decision,
+                    subject=subject,
+                    tool_id=tool_id,
+                    action=action,
                 ),
-                artifacts=(str(exc),),
-                security_decision=security_decision,
-                subject=subject,
-                tool_id=tool_id,
-                action=action,
+                metadata=metadata,
             )
 
         # ---------------------------------------------------------
@@ -480,35 +517,83 @@ class ToolGateway:
         )
 
         if not output_validation.valid:
-            return ToolExecutionResult(
-                status="INVALID_OUTPUT",
-                summary=output_validation.summary,
-                next_actions=(
-                    "Do not trust the tool output.",
-                    "Inspect the tool output against its registered schema.",
-                    "Review the tool implementation.",
+            return self._finalize(
+                ToolExecutionResult(
+                    status="INVALID_OUTPUT",
+                    summary=output_validation.summary,
+                    next_actions=(
+                        "Do not trust the tool output.",
+                        "Inspect the tool output against its registered schema.",
+                        "Review the tool implementation.",
+                    ),
+                    artifacts=output_validation.errors,
+                    security_decision=security_decision,
+                    subject=subject,
+                    tool_id=tool_id,
+                    action=action,
                 ),
-                artifacts=output_validation.errors,
-                security_decision=security_decision,
-                subject=subject,
-                tool_id=tool_id,
-                action=action,
+                metadata=metadata,
             )
 
         # ---------------------------------------------------------
         # 13. Successful execution.
         # ---------------------------------------------------------
 
-        return ToolExecutionResult(
-            status="SUCCESS",
-            summary="Tool executed successfully.",
-            next_actions=(),
-            artifacts=(output,),
-            security_decision=security_decision,
-            subject=subject,
-            tool_id=tool_id,
-            action=action,
+        return self._finalize(
+            ToolExecutionResult(
+                status="SUCCESS",
+                summary="Tool executed successfully.",
+                next_actions=(),
+                artifacts=(output,),
+                security_decision=security_decision,
+                subject=subject,
+                tool_id=tool_id,
+                action=action,
+            ),
+            metadata=metadata,
         )
+
+    def _finalize(
+        self,
+        result: ToolExecutionResult,
+        *,
+        metadata: dict[str, Any] | None,
+    ) -> ToolExecutionResult:
+        """
+        Report `result`'s real outcome to the Security Layer's audit
+        trail, then return it unchanged.
+
+        Build Phase 13: every one of `execute()`'s return points --
+        whether it stopped at registry lookup, executor resolution,
+        input validation, the security decision itself, the private
+        executor, or output validation -- now funnels through here
+        exactly once, so SECURITY_SPEC.md's Audit Logging requirement
+        ("Audit records must distinguish between: requested /
+        authorized / executed / blocked / failed ... This allows the
+        system to determine whether an operation was merely requested
+        or actually executed") is actually true of this system, not
+        just documented. `SecurityDecisionPoint.record_execution_
+        outcome()` (core/security/engine/security_decision.py) owns
+        the actual status→vocabulary mapping and the audit write
+        itself; this method's only job is making sure every path
+        calls it with the real, final `result`.
+
+        `metadata` is threaded through unchanged so the execution-
+        outcome audit event can be correlated with the security-
+        decision event `_evaluate()` already recorded for the same
+        call, exactly as `execute()`'s own caller-supplied metadata
+        already is for that first event.
+        """
+
+        self.security.record_execution_outcome(
+            security_decision=result.security_decision,
+            tool_id=result.tool_id,
+            tool_status=result.status,
+            summary=result.summary,
+            metadata=metadata,
+        )
+
+        return result
 
     @staticmethod
     def _risk_is_consistent(

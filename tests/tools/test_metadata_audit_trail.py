@@ -78,8 +78,26 @@ def _build_gateway(tmp_dir: Path):
 
 
 def _read_last_audit_event(audit_log_path: Path) -> dict:
+    """
+    Return the last recorded "security_decision" audit event.
+
+    Build Phase 13 made ToolGateway.execute() record a SECOND, later
+    audit event per call ("execution_outcome", via
+    SecurityDecisionPoint.record_execution_outcome()) reporting what
+    actually happened after the security decision below was made --
+    see that method's own docstring. Filtering by event type here
+    (rather than assuming the security-decision event is simply the
+    last line) keeps this helper correct regardless of how many
+    distinct audit event types a given call produces. (It also
+    carries `metadata`, same as the security-decision event, so this
+    filter does not change what these tests actually verify.)
+    """
     lines = audit_log_path.read_text(encoding="utf-8").strip().splitlines()
-    return json.loads(lines[-1])
+    events = [json.loads(line) for line in lines]
+    security_decision_events = [
+        event for event in events if event.get("event") == "security_decision"
+    ]
+    return security_decision_events[-1]
 
 
 def test_caller_metadata_is_recorded_in_the_audit_log():
