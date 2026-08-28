@@ -23,6 +23,10 @@ from core.orchestration.orchestration_engine import (
     OrchestrationEngine,
 )
 
+from core.policies.policy_engine import (
+    PolicyEngine,
+)
+
 
 # ---------------------------------------------------------------------
 # Real (v1) implementation of core/kernel/KERNEL_SPEC.md.
@@ -83,7 +87,17 @@ from core.orchestration.orchestration_engine import (
 #                           decision engine raised, e.g. a transient
 #                           LLM API hiccup) and EXECUTION_ERROR (a tool
 #                           executor raised unexpectedly, e.g. a
-#                           network blip). Never retried: FAILED (an
+#                           network blip). As of this Kernel, which
+#                           status counts as recoverable is no longer a
+#                           private Kernel heuristic: _should_recover
+#                           asks a real core.policies.policy_engine.
+#                           PolicyEngine.is_recovery_authorized() call,
+#                           making POLICY_SPEC.md's Failure Policy step
+#                           4 ("attempt recovery only when the recovery
+#                           is itself authorized") a real, inspectable
+#                           Policy Layer decision the Kernel consults,
+#                           per that spec's own "Policy Enforcement"
+#                           section. Never retried: FAILED (an
 #                           agent's own deliberate decision -- second-
 #                           guessing that is not "recovery", it's
 #                           overriding the agent), TOOL_ERROR (the tool
@@ -281,6 +295,12 @@ class Kernel:
     made after an initial DECISION_ERROR/EXECUTION_ERROR before giving
     up and reporting it. Defaults to 1. Pass 0 to disable recovery
     entirely -- the first attempt's result is always returned as-is.
+
+    `policy_engine` is the real (v1) core/policies/POLICY_SPEC.md
+    implementation (core.policies.policy_engine.PolicyEngine) this
+    Kernel consults for RECOVER IF NEEDED's authorization decision
+    (see _should_recover). Defaults to a fresh PolicyEngine(); injected
+    mainly for tests that want to substitute or inspect it.
     """
 
     def __init__(
@@ -288,6 +308,7 @@ class Kernel:
         *,
         orchestration_engine: OrchestrationEngine | None = None,
         max_recovery_attempts: int = 1,
+        policy_engine: PolicyEngine | None = None,
     ) -> None:
 
         if not isinstance(max_recovery_attempts, int):
@@ -306,6 +327,12 @@ class Kernel:
             orchestration_engine
             if orchestration_engine is not None
             else create_default_orchestration_engine()
+        )
+
+        self.policy_engine = (
+            policy_engine
+            if policy_engine is not None
+            else PolicyEngine()
         )
 
     def register_agent(
@@ -556,22 +583,27 @@ class Kernel:
             max_steps=max_steps,
         )
 
-    _RECOVERABLE_STATUSES = frozenset({"DECISION_ERROR", "EXECUTION_ERROR"})
-
     def _should_recover(
         self,
         loop_result: AgentLoopResult,
     ) -> bool:
         """
-        RECOVER IF NEEDED. Real: returns True only for a status that
-        indicates something crashed unexpectedly (DECISION_ERROR,
-        EXECUTION_ERROR), never for a considered outcome the agent or
-        loop reported deliberately (FAILED, TOOL_ERROR,
-        APPROVAL_REQUIRED, MAX_STEPS_EXCEEDED, INVALID_ACTION). See
-        this module's own docstring for the full reasoning.
+        RECOVER IF NEEDED. Real: delegates to
+        self.policy_engine.is_recovery_authorized(), which returns
+        True only for a status that indicates something crashed
+        unexpectedly (DECISION_ERROR, EXECUTION_ERROR), never for a
+        considered outcome the agent or loop reported deliberately
+        (FAILED, TOOL_ERROR, APPROVAL_REQUIRED, MAX_STEPS_EXCEEDED,
+        INVALID_ACTION). The Kernel itself no longer decides which
+        statuses are recoverable -- that is now a Policy Layer
+        decision (core/policies/policy_engine.py), per POLICY_SPEC.md's
+        Failure Policy step 4 and its own "Policy Enforcement" section.
+        See both modules' docstrings for the full reasoning.
         """
 
-        return loop_result.status in self._RECOVERABLE_STATUSES
+        return self.policy_engine.is_recovery_authorized(
+            loop_result.status
+        )
 
     def _verify(
         self,

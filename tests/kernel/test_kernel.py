@@ -37,6 +37,8 @@ from core.orchestration.orchestration_engine import (
     SequentialOrchestrationEngine,
 )
 
+from core.policies.policy_engine import PolicyEngine
+
 from core.security.engine.security_decision import SecurityDecisionPoint
 
 from core.tools.engine.tool_gateway import ToolGateway
@@ -618,6 +620,98 @@ def test_max_recovery_attempts_zero_disables_recovery():
 
         assert result.status == "DECISION_ERROR"
         assert result.recovery_attempts == 0
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_kernel_defaults_to_a_real_policy_engine():
+    kernel = Kernel(orchestration_engine=SequentialOrchestrationEngine())
+
+    assert isinstance(kernel.policy_engine, PolicyEngine)
+
+
+def test_should_recover_genuinely_delegates_to_the_injected_policy_engine():
+    """
+    Proves _should_recover() actually calls out to
+    self.policy_engine.is_recovery_authorized() rather than deciding
+    on its own -- a policy engine that authorizes recovery for a
+    status Kernel's own default PolicyEngine never would (FAILED) is
+    obeyed, and one that denies recovery for a status the default
+    PolicyEngine always would (EXECUTION_ERROR) is also obeyed. This
+    is what makes RECOVER IF NEEDED a real Policy Layer decision
+    (POLICY_SPEC.md's Failure Policy step 4 / "Policy Enforcement"
+    section) rather than a hardcoded Kernel heuristic in disguise.
+    """
+
+    class _AuthorizeEverythingPolicyEngine(PolicyEngine):
+        def is_recovery_authorized(self, status: str) -> bool:
+            return True
+
+    class _AuthorizeNothingPolicyEngine(PolicyEngine):
+        def is_recovery_authorized(self, status: str) -> bool:
+            return False
+
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        # A policy engine that authorizes recovery even for FAILED (a
+        # deliberate agent decision the default PolicyEngine never
+        # retries) causes a real retry when injected.
+        kernel = Kernel(
+            orchestration_engine=SequentialOrchestrationEngine(),
+            policy_engine=_AuthorizeEverythingPolicyEngine(),
+        )
+
+        agent_build_count = {"n": 0}
+
+        def build_failing_agent():
+            agent_build_count["n"] += 1
+            return _build_zero_tool_agent(tmp_dir)
+
+        class _FailEngine(AgentDecisionEngine):
+            def decide(self, context):
+                return AgentAction(
+                    action_type=AgentActionType.FAIL,
+                    reason="Deliberate failure.",
+                )
+
+        kernel.register_agent(
+            AgentRegistration(
+                subject="test_agent",
+                description="Always fails deliberately.",
+                can_handle=lambda normalized: True,
+                build_agent=build_failing_agent,
+                build_decision_engine=lambda: _FailEngine(),
+            )
+        )
+
+        result = kernel.run("Do something that deliberately fails.")
+
+        assert result.status == "FAILED"
+        assert result.recovery_attempts == 1
+        assert agent_build_count["n"] == 2
+
+        # A policy engine that authorizes nothing suppresses recovery
+        # even for EXECUTION_ERROR (a status the default PolicyEngine
+        # always authorizes recovery for).
+        kernel2 = Kernel(
+            orchestration_engine=SequentialOrchestrationEngine(),
+            policy_engine=_AuthorizeNothingPolicyEngine(),
+        )
+
+        kernel2.register_agent(
+            AgentRegistration(
+                subject="test_agent",
+                description="Always invokes a tool that doesn't exist.",
+                can_handle=lambda normalized: True,
+                build_agent=lambda: _build_zero_tool_agent(tmp_dir),
+                build_decision_engine=lambda: _NeverCompleteEngine(),
+            )
+        )
+
+        result2 = kernel2.run("Do something impossible.")
+
+        assert result2.status == "EXECUTION_ERROR"
+        assert result2.recovery_attempts == 0
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 

@@ -32,6 +32,10 @@ from core.orchestration.orchestration_engine import (
     OrchestrationEngine,
 )
 
+from core.policies.policy_engine import (
+    PolicyEngine,
+)
+
 
 # ---------------------------------------------------------------------
 # Convenience wiring: a Kernel with research_agent registered, the
@@ -72,6 +76,7 @@ def build_default_kernel(
     max_tokens: int | None = None,
     orchestration_engine: OrchestrationEngine | None = None,
     max_recovery_attempts: int = 1,
+    policy_engine: PolicyEngine | None = None,
 ) -> Kernel:
     """
     Build a Kernel with research_agent already registered.
@@ -93,6 +98,10 @@ def build_default_kernel(
     `documents_root`/`findings_root`/`serper_api_key`/
     `permissions_path`/`audit_log_path` are passed straight through to
     build_research_agent() -- see that function's own docstring.
+
+    `policy_engine` is passed straight through to Kernel() -- see its
+    own docstring (core/kernel/kernel.py). Defaults to a fresh
+    PolicyEngine() when not supplied.
     """
 
     if decision_engine_factory is None:
@@ -133,6 +142,7 @@ def build_default_kernel(
     kernel = Kernel(
         orchestration_engine=orchestration_engine,
         max_recovery_attempts=max_recovery_attempts,
+        policy_engine=policy_engine,
     )
 
     kernel.register_agent(
