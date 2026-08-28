@@ -71,6 +71,7 @@ def build_default_kernel(
     temperature: float | None = None,
     max_tokens: int | None = None,
     orchestration_engine: OrchestrationEngine | None = None,
+    max_recovery_attempts: int = 1,
 ) -> Kernel:
     """
     Build a Kernel with research_agent already registered.
@@ -131,6 +132,7 @@ def build_default_kernel(
 
     kernel = Kernel(
         orchestration_engine=orchestration_engine,
+        max_recovery_attempts=max_recovery_attempts,
     )
 
     kernel.register_agent(

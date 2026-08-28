@@ -71,11 +71,38 @@ from core.orchestration.orchestration_engine import (
 #                           directly -- the Kernel must not "replace
 #                           the orchestration layer" (Sec.3)
 #   OBSERVE                 real: the returned AgentLoopResult
-#   RECOVER IF NEEDED       explicit no-op passthrough (_recover) --
-#                           a real retry/recovery policy needs a
-#                           concrete failure mode to design around;
-#                           inventing one now risks solving the wrong
-#                           problem
+#   RECOVER IF NEEDED       real but deliberately narrow (_should_
+#                           recover): a bounded number of full,
+#                           fresh re-attempts (new agent + new
+#                           decision engine from the same
+#                           registration, via Kernel.__init__'s
+#                           max_recovery_attempts, default 1) ONLY for
+#                           AgentLoopResult statuses that indicate
+#                           something crashed unexpectedly rather than
+#                           a considered outcome -- DECISION_ERROR (the
+#                           decision engine raised, e.g. a transient
+#                           LLM API hiccup) and EXECUTION_ERROR (a tool
+#                           executor raised unexpectedly, e.g. a
+#                           network blip). Never retried: FAILED (an
+#                           agent's own deliberate decision -- second-
+#                           guessing that is not "recovery", it's
+#                           overriding the agent), TOOL_ERROR (the tool
+#                           ran and reported a real result, not a
+#                           crash), APPROVAL_REQUIRED (retrying
+#                           wouldn't change anything -- it's still
+#                           waiting on a human), MAX_STEPS_EXCEEDED/
+#                           INVALID_ACTION (retrying an identical plan
+#                           would just reproduce the same outcome).
+#                           Every retry rebuilds the agent and decision
+#                           engine from scratch via the registration's
+#                           factories rather than resuming -- simpler
+#                           and safer than trying to resume a possibly-
+#                           partial AgentState after an unexpected
+#                           exception (SYSTEM_CONSTITUTION.md's "No
+#                           unnecessary complexity"). KernelResult.
+#                           recovery_attempts reports exactly how many
+#                           retries actually happened, so recovery is
+#                           inspectable, never silent.
 #   VERIFY                  real (_verify) -- see KernelVerification
 #   HUMAN APPROVAL           real: an AgentLoopResult of
 #   IF REQUIRED             APPROVAL_REQUIRED is surfaced as
@@ -182,6 +209,7 @@ class KernelResult:
     loop_result: AgentLoopResult | None
     verification: KernelVerification | None
     reason: str | None
+    recovery_attempts: int = 0
 
 
 @dataclass(frozen=True)
@@ -247,15 +275,32 @@ class Kernel:
     - replace the memory layer (no memory layer exists yet; see this
       module's own docstring)
     - silently resolve an approval requirement
+
+    `max_recovery_attempts` bounds RECOVER IF NEEDED (see this
+    module's own docstring): the number of additional, fresh attempts
+    made after an initial DECISION_ERROR/EXECUTION_ERROR before giving
+    up and reporting it. Defaults to 1. Pass 0 to disable recovery
+    entirely -- the first attempt's result is always returned as-is.
     """
 
     def __init__(
         self,
         *,
         orchestration_engine: OrchestrationEngine | None = None,
+        max_recovery_attempts: int = 1,
     ) -> None:
 
+        if not isinstance(max_recovery_attempts, int):
+            raise TypeError("max_recovery_attempts must be an integer.")
+
+        if max_recovery_attempts < 0:
+            raise ValueError(
+                "max_recovery_attempts must be zero or greater."
+            )
+
         self._registrations: list[AgentRegistration] = []
+
+        self.max_recovery_attempts = max_recovery_attempts
 
         self.orchestration_engine = (
             orchestration_engine
@@ -321,21 +366,24 @@ class Kernel:
             self._select_strategy(classification)
         )
 
-        plan = self._plan(
+        recovery_attempts = 0
+        loop_result = self._execute_once(
             registration=registration,
             normalized=normalized,
             max_steps=max_steps,
         )
 
-        plan.agent.start_task(normalized.text)
+        while (
+            recovery_attempts < self.max_recovery_attempts
+            and self._should_recover(loop_result)
+        ):
+            recovery_attempts += 1
 
-        loop_result = self.orchestration_engine.run(
-            agent=plan.agent,
-            decision_engine=plan.decision_engine,
-            max_steps=plan.max_steps,
-        )
-
-        loop_result = self._recover(loop_result)
+            loop_result = self._execute_once(
+                registration=registration,
+                normalized=normalized,
+                max_steps=max_steps,
+            )
 
         verification = self._verify(loop_result)
 
@@ -345,10 +393,39 @@ class Kernel:
 
         return KernelResult(
             status=status,
-            subject=plan.subject,
+            subject=registration.subject,
             loop_result=loop_result,
             verification=verification,
             reason=loop_result.reason,
+            recovery_attempts=recovery_attempts,
+        )
+
+    def _execute_once(
+        self,
+        *,
+        registration: AgentRegistration,
+        normalized: NormalizedTask,
+        max_steps: int,
+    ) -> AgentLoopResult:
+        """
+        Build a fresh PLAN from `registration` and run it once through
+        the OrchestrationEngine. Used both for the initial attempt and
+        for every RECOVER IF NEEDED retry -- always a full, fresh
+        attempt, never a resume.
+        """
+
+        plan = self._plan(
+            registration=registration,
+            normalized=normalized,
+            max_steps=max_steps,
+        )
+
+        plan.agent.start_task(normalized.text)
+
+        return self.orchestration_engine.run(
+            agent=plan.agent,
+            decision_engine=plan.decision_engine,
+            max_steps=plan.max_steps,
         )
 
     # -- Lifecycle steps ------------------------------------------------
@@ -479,17 +556,22 @@ class Kernel:
             max_steps=max_steps,
         )
 
-    def _recover(
+    _RECOVERABLE_STATUSES = frozenset({"DECISION_ERROR", "EXECUTION_ERROR"})
+
+    def _should_recover(
         self,
         loop_result: AgentLoopResult,
-    ) -> AgentLoopResult:
+    ) -> bool:
         """
-        RECOVER IF NEEDED. Explicit no-op passthrough. See this
-        module's own docstring for why a real recovery policy isn't
-        implemented yet.
+        RECOVER IF NEEDED. Real: returns True only for a status that
+        indicates something crashed unexpectedly (DECISION_ERROR,
+        EXECUTION_ERROR), never for a considered outcome the agent or
+        loop reported deliberately (FAILED, TOOL_ERROR,
+        APPROVAL_REQUIRED, MAX_STEPS_EXCEEDED, INVALID_ACTION). See
+        this module's own docstring for the full reasoning.
         """
 
-        return loop_result
+        return loop_result.status in self._RECOVERABLE_STATUSES
 
     def _verify(
         self,
