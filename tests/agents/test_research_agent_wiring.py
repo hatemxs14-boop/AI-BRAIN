@@ -2,15 +2,18 @@
 Tests for the real research_agent wiring (core.agents.research_agent):
 build_research_agent() and run_research_agent() assembling real tools
 (web_search via Serper.dev, read_document sandboxed to a workspace
-directory, read_webpage for fetching a public URL's text content)
-behind the full, unmodified security stack.
+directory, read_webpage for fetching a public URL's text content,
+write_research_findings for persisting an explicitly-authorized
+finding) behind the full, unmodified security stack.
 
 No real network access is used: the web_search path is exercised by
 patching `requests.post` on the web_search_tool module, exactly as
 tests/tools/implementations/test_web_search_tool.py already does for
 that module directly; the read_webpage path similarly patches
 `requests.get` and `socket.getaddrinfo` on the webpage_read_tool
-module, as tests/tools/implementations/test_webpage_read_tool.py does.
+module, as tests/tools/implementations/test_webpage_read_tool.py does;
+write_research_findings needs no network fake at all (a real, sandboxed
+filesystem write), only an isolated temp findings root.
 """
 from __future__ import annotations
 
@@ -84,6 +87,58 @@ class _ReadWebpageThenCompleteEngine(AgentDecisionEngine):
         )
 
 
+class _WriteFindingsWithoutApprovalEngine(AgentDecisionEngine):
+    """
+    Attempts write_research_findings with no approval at all, proving
+    the HIGH-risk/"policy" gate pauses the agent instead of writing.
+    """
+
+    def __init__(self, filename: str):
+        self._filename = filename
+
+    def decide(self, context: AgentContext) -> AgentAction:
+        return AgentAction(
+            action_type=AgentActionType.INVOKE_TOOL,
+            tool_id="write_research_findings",
+            inputs={
+                "filename": self._filename,
+                "content": "This should not be written without approval.",
+            },
+            reason="Attempting to write a finding without approval.",
+        )
+
+
+class _WriteFindingsWithApprovalEngine(AgentDecisionEngine):
+    """
+    Deterministic engine mirroring _ReadDocumentThenCompleteEngine's
+    shape, but exercising write_research_findings with an explicit,
+    attributed approval supplied up front on the AgentAction itself.
+    """
+
+    def __init__(self, filename: str, content: str):
+        self._filename = filename
+        self._content = content
+
+    def decide(self, context: AgentContext) -> AgentAction:
+        if not context.tool_results:
+            return AgentAction(
+                action_type=AgentActionType.INVOKE_TOOL,
+                tool_id="write_research_findings",
+                inputs={
+                    "filename": self._filename,
+                    "content": self._content,
+                },
+                reason="Persisting an explicitly authorized finding.",
+                approved=True,
+                approved_by="human_operator",
+            )
+
+        return AgentAction(
+            action_type=AgentActionType.COMPLETE,
+            reason="The finding has been persisted.",
+        )
+
+
 def _patched_public_resolution(ip: str = "93.184.216.34"):
     def fake_getaddrinfo(host, port, *args, **kwargs):
         return [
@@ -135,16 +190,22 @@ def _make_documents_root(*, with_sample=True) -> str:
     return root
 
 
+def _make_findings_root() -> str:
+    return tempfile.mkdtemp()
+
+
 # ---------------------------------------------------------------------
 # build_research_agent(): tool discovery and configuration errors
 # ---------------------------------------------------------------------
 
-def test_build_research_agent_exposes_exactly_the_three_wired_tools():
+def test_build_research_agent_exposes_exactly_the_four_wired_tools():
     docs_root = _make_documents_root()
+    findings_root = _make_findings_root()
     audit_dir = tempfile.mkdtemp()
     try:
         agent = build_research_agent(
             documents_root=docs_root,
+            findings_root=findings_root,
             serper_api_key="test-key",
             audit_log_path=os.path.join(audit_dir, "audit.jsonl"),
         )
@@ -153,10 +214,16 @@ def test_build_research_agent_exposes_exactly_the_three_wired_tools():
 
         tool_ids = {tool.id for tool in agent.discover_tools()}
 
-        assert tool_ids == {"web_search", "read_document", "read_webpage"}
+        assert tool_ids == {
+            "web_search",
+            "read_document",
+            "read_webpage",
+            "write_research_findings",
+        }
         assert "shell" not in tool_ids
     finally:
         shutil.rmtree(docs_root)
+        shutil.rmtree(findings_root)
         shutil.rmtree(audit_dir)
 
 
@@ -284,6 +351,75 @@ def test_run_research_agent_completes_a_read_webpage_task():
         assert "The sky is blue." in artifact["content"]
     finally:
         shutil.rmtree(docs_root)
+        shutil.rmtree(audit_dir)
+
+
+def test_run_research_agent_pauses_for_approval_when_writing_findings():
+    """
+    write_research_findings is HIGH risk / "policy" approval by
+    design (see core.agents.research_agent's module docstring and
+    write_research_findings_tool's own docstring): a decision engine
+    that requests it with no approval at all must pause the agent
+    exactly like tests/agents/test_agent_await_approval.py's generic
+    HIGH-risk fixture does -- never write anything.
+    """
+    docs_root = _make_documents_root()
+    findings_root = _make_findings_root()
+    audit_dir = tempfile.mkdtemp()
+    try:
+        result = run_research_agent(
+            "Persist a finding.",
+            decision_engine=_WriteFindingsWithoutApprovalEngine(
+                "finding.md"
+            ),
+            documents_root=docs_root,
+            findings_root=findings_root,
+            serper_api_key="unused-but-required-key",
+            audit_log_path=os.path.join(audit_dir, "audit.jsonl"),
+            max_steps=3,
+        )
+
+        assert result.status == "APPROVAL_REQUIRED"
+        assert not Path(findings_root, "finding.md").exists()
+    finally:
+        shutil.rmtree(docs_root)
+        shutil.rmtree(findings_root)
+        shutil.rmtree(audit_dir)
+
+
+def test_run_research_agent_completes_a_write_research_findings_task():
+    docs_root = _make_documents_root()
+    findings_root = _make_findings_root()
+    audit_dir = tempfile.mkdtemp()
+    try:
+        result = run_research_agent(
+            "Persist a finding.",
+            decision_engine=_WriteFindingsWithApprovalEngine(
+                "finding.md",
+                "The sky is blue, confirmed by two independent sources.",
+            ),
+            documents_root=docs_root,
+            findings_root=findings_root,
+            serper_api_key="unused-but-required-key",
+            audit_log_path=os.path.join(audit_dir, "audit.jsonl"),
+            max_steps=3,
+        )
+
+        assert result.status == "COMPLETED"
+        assert result.last_result is not None
+        assert result.last_result.status == "SUCCESS"
+
+        (artifact,) = result.last_result.artifacts
+        assert artifact["path"] == "finding.md"
+
+        written = Path(findings_root, "finding.md")
+        assert written.exists()
+        assert "confirmed by two independent sources" in (
+            written.read_text(encoding="utf-8")
+        )
+    finally:
+        shutil.rmtree(docs_root)
+        shutil.rmtree(findings_root)
         shutil.rmtree(audit_dir)
 
 

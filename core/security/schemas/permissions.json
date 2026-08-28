@@ -24,6 +24,14 @@
       "scope": "public_web",
       "risk_level": "LOW",
       "approval": "none"
+    },
+    {
+      "subject": "research_agent",
+      "resource": "research_findings",
+      "action": "write",
+      "scope": "workspace",
+      "risk_level": "HIGH",
+      "approval": "policy"
     }
   ],
   "defaults": {

@@ -55,6 +55,12 @@ from core.tools.implementations.webpage_read_tool import (
     create_webpage_read_executor,
 )
 
+from core.tools.implementations.write_research_findings_tool import (
+    WRITE_RESEARCH_FINDINGS_TOOL,
+    WRITE_RESEARCH_FINDINGS_TOOL_ID,
+    create_write_research_findings_executor,
+)
+
 from core.tools.registry.tool_registry import (
     ToolRegistry,
 )
@@ -78,18 +84,19 @@ from core.tools.runtime.tool_runtime import (
 # executors here really do something instead of returning a canned
 # string.
 #
-# Real tools wired here (all three LOW risk_level -- auto-execute, no
-# approval required):
+# Real tools wired here:
 #
-#   web_search      resource=web_search   action=search  scope=public_web
+#   web_search      resource=web_search        action=search scope=public_web
 #                    -> core.tools.implementations.web_search_tool
 #                       (real Serper.dev / Google search call)
+#                       LOW risk -- auto-executes, no approval required.
 #
-#   read_document   resource=document     action=read    scope=workspace
+#   read_document   resource=document          action=read   scope=workspace
 #                    -> core.tools.implementations.document_read_tool
 #                       (real, sandboxed plain-text/Markdown file read)
+#                       LOW risk -- auto-executes, no approval required.
 #
-#   read_webpage    resource=webpage      action=read    scope=public_web
+#   read_webpage    resource=webpage           action=read   scope=public_web
 #                    -> core.tools.implementations.webpage_read_tool
 #                       (real HTTP GET of one public URL, HTML reduced
 #                       to plain text -- closes the gap web_search
@@ -98,6 +105,21 @@ from core.tools.runtime.tool_runtime import (
 #                       itself; see that module's own docstring for its
 #                       SSRF-defense design and one documented
 #                       limitation)
+#                       LOW risk -- auto-executes, no approval required.
+#
+#   write_research_findings  resource=research_findings action=write
+#                             scope=workspace
+#                    -> core.tools.implementations.write_research_findings_tool
+#                       (real, sandboxed, write-once persistence of a
+#                       research finding -- the "write research
+#                       findings when explicitly authorized" capability
+#                       RESEARCH_AGENT.md's Memory Access section
+#                       allows)
+#                       HIGH risk, "policy" approval -- every call
+#                       returns APPROVAL_REQUIRED unless the caller
+#                       supplies an explicit, attributed approval; see
+#                       that module's own docstring for why this is
+#                       the one tool here that is NOT auto-executing.
 #
 # Resolved contradiction: permissions.json used to also grant
 # research_agent a HIGH-risk permission for resource=shell/
@@ -125,11 +147,13 @@ RESEARCH_AGENT_SUBJECT = "research_agent"
 
 DEFAULT_PERMISSIONS_PATH = "core/security/schemas/permissions.json"
 DEFAULT_DOCUMENTS_ROOT = "workspace/research_documents"
+DEFAULT_FINDINGS_ROOT = "workspace/research_findings"
 
 
 def build_research_agent(
     *,
     documents_root: str | Path = DEFAULT_DOCUMENTS_ROOT,
+    findings_root: str | Path = DEFAULT_FINDINGS_ROOT,
     serper_api_key: str | None = None,
     permissions_path: str | Path = DEFAULT_PERMISSIONS_PATH,
     audit_log_path: str | None = None,
@@ -147,6 +171,13 @@ def build_research_agent(
     `documents_root` must already exist as a directory (see
     create_document_read_executor) -- defaults to the
     workspace/research_documents/ sandbox shipped in this repo.
+
+    `findings_root` must likewise already exist as a directory (see
+    create_write_research_findings_executor) -- defaults to the
+    workspace/research_findings/ sandbox shipped in this repo. Every
+    write_research_findings call still requires explicit approval
+    regardless of this path (see this module's own docstring); this
+    only controls WHERE an approved write is allowed to land.
     """
 
     registry = ToolRegistry()
@@ -154,6 +185,7 @@ def build_research_agent(
     registry.register(WEB_SEARCH_TOOL)
     registry.register(READ_DOCUMENT_TOOL)
     registry.register(READ_WEBPAGE_TOOL)
+    registry.register(WRITE_RESEARCH_FINDINGS_TOOL)
 
     security_kwargs: dict[str, Any] = {}
 
@@ -189,6 +221,13 @@ def build_research_agent(
         executor=create_webpage_read_executor(),
     )
 
+    gateway.register_executor(
+        tool_id=WRITE_RESEARCH_FINDINGS_TOOL_ID,
+        executor=create_write_research_findings_executor(
+            findings_root,
+        ),
+    )
+
     runtime = ToolRuntime(
         registry=registry,
         gateway=gateway,
@@ -221,6 +260,7 @@ def run_research_agent(
     llm_client: LLMClient | None = None,
     decision_engine: AgentDecisionEngine | None = None,
     documents_root: str | Path = DEFAULT_DOCUMENTS_ROOT,
+    findings_root: str | Path = DEFAULT_FINDINGS_ROOT,
     serper_api_key: str | None = None,
     permissions_path: str | Path = DEFAULT_PERMISSIONS_PATH,
     audit_log_path: str | None = None,
@@ -258,6 +298,7 @@ def run_research_agent(
 
     agent = build_research_agent(
         documents_root=documents_root,
+        findings_root=findings_root,
         serper_api_key=serper_api_key,
         permissions_path=permissions_path,
         audit_log_path=audit_log_path,
