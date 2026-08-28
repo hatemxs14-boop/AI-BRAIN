@@ -38,6 +38,7 @@ from core.agents.research_agent import (
     run_research_agent,
 )
 from core.policies.policy_engine import (
+    AgentPermissionAlignment,
     AgentScopeEvaluation,
     PolicyEngine,
 )
@@ -212,6 +213,37 @@ class _AlwaysOutOfScopePolicyEngine(PolicyEngine):
         )
 
 
+class _AlwaysMisalignedPolicyEngine(PolicyEngine):
+    """
+    A PolicyEngine stand-in whose evaluate_agent_permission_alignment()
+    always reports aligned=False, regardless of what is actually
+    granted/needed -- injected to prove build_research_agent()
+    genuinely delegates to the supplied policy_engine's config-side
+    alignment check too (Build Phase 10), not just its tool-id scope
+    check (Build Phase 9). evaluate_agent_scope() is left as the real,
+    inherited implementation so a normal build reaches this second
+    check at all.
+    """
+
+    def evaluate_agent_permission_alignment(
+        self,
+        *,
+        subject: str,
+        tool_grants_needed,
+        security_grants_present,
+    ) -> AgentPermissionAlignment:
+        needed = frozenset(tool_grants_needed)
+        present = frozenset(security_grants_present)
+        return AgentPermissionAlignment(
+            subject=subject,
+            tool_grants_needed=needed,
+            security_grants_present=present,
+            missing_grants=needed,
+            extra_grants=present,
+            aligned=False,
+        )
+
+
 def _make_documents_root(*, with_sample=True) -> str:
     root = tempfile.mkdtemp()
     if with_sample:
@@ -298,6 +330,30 @@ def test_build_research_agent_raises_when_policy_engine_reports_out_of_scope():
                 findings_root=findings_root,
                 serper_api_key="test-key",
                 policy_engine=_AlwaysOutOfScopePolicyEngine(),
+            )
+    finally:
+        shutil.rmtree(docs_root)
+        shutil.rmtree(findings_root)
+
+
+def test_build_research_agent_raises_when_policy_engine_reports_misaligned_permissions():
+    """
+    Genuine delegation proof (Build Phase 10): with an otherwise
+    completely normal build against the real, aligned permissions.json,
+    injecting a policy_engine whose evaluate_agent_permission_alignment()
+    reports aligned=False must still make build_research_agent() raise
+    ValueError -- proving the config-side alignment check actually asks
+    the supplied policy_engine and acts on its answer.
+    """
+    docs_root = _make_documents_root()
+    findings_root = _make_findings_root()
+    try:
+        with pytest.raises(ValueError, match="drifted"):
+            build_research_agent(
+                documents_root=docs_root,
+                findings_root=findings_root,
+                serper_api_key="test-key",
+                policy_engine=_AlwaysMisalignedPolicyEngine(),
             )
     finally:
         shutil.rmtree(docs_root)

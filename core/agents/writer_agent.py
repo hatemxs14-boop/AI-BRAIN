@@ -120,6 +120,12 @@ from core.tools.runtime.tool_runtime import (
 # and raises immediately if they ever diverge -- see that method's own
 # docstring, and core/agents/research_agent.py's identical check, for
 # exactly what this does and does not cover.
+#
+# Agent Constraints check (Build Phase 10): build_writer_agent() also
+# calls PolicyEngine.evaluate_agent_permission_alignment() right after
+# constructing its SecurityDecisionPoint -- the same config-side
+# alignment check research_agent.py's own module docstring describes,
+# applied here to writer_agent's own two tools/grants.
 # ---------------------------------------------------------------------
 
 WRITER_AGENT_SUBJECT = "writer_agent"
@@ -202,6 +208,35 @@ def build_writer_agent(
         str(permissions_path),
         **security_kwargs,
     )
+
+    permission_alignment = policy_engine.evaluate_agent_permission_alignment(
+        subject=WRITER_AGENT_SUBJECT,
+        tool_grants_needed={
+            (tool.resource, tool.action, tool.scope)
+            for tool in registry.list_tools()
+        },
+        security_grants_present={
+            (permission.get("resource"), permission.get("action"), permission.get("scope"))
+            for permission in security.authorization_engine.policy.get(
+                "permissions", []
+            )
+            if isinstance(permission, dict)
+            and permission.get("subject") == WRITER_AGENT_SUBJECT
+        },
+    )
+
+    if not permission_alignment.aligned:
+        raise ValueError(
+            "writer_agent's build_writer_agent() has drifted from "
+            f"{permissions_path}: missing grant(s) "
+            f"{sorted(permission_alignment.missing_grants)} (a "
+            "registered tool needs these but permissions.json never "
+            "grants them -- every real call would be DENIED), extra "
+            f"grant(s) {sorted(permission_alignment.extra_grants)} (a "
+            "standing permission no registered tool needs at all). See "
+            "POLICY_SPEC.md's Agent Constraints ('operate only within "
+            "declared responsibilities')."
+        )
 
     gateway = ToolGateway(
         security=security,

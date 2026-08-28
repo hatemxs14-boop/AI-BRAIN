@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from core.policies.policy_engine import (
+    AgentPermissionAlignment,
     AgentScopeEvaluation,
     ExternalActionEvaluation,
     PolicyEngine,
@@ -380,4 +381,76 @@ def test_evaluate_agent_scope_rejects_empty_subject():
             subject="   ",
             declared_tool_ids={"web_search"},
             actual_tool_ids={"web_search"},
+        )
+
+
+# ---------------------------------------------------------------------
+# evaluate_agent_permission_alignment (Agent Constraints -- config-side
+# alignment between registered tools and permissions.json's real
+# grants, Build Phase 10). A second, complementary slice of "operate
+# only within declared responsibilities" alongside evaluate_agent_scope
+# above -- see that method's own docstring for the code-side check.
+# ---------------------------------------------------------------------
+
+def test_evaluate_agent_permission_alignment_reports_aligned_when_grants_exactly_match():
+    engine = PolicyEngine()
+
+    grants = {("web_search", "search", "public_web")}
+
+    evaluation = engine.evaluate_agent_permission_alignment(
+        subject="research_agent",
+        tool_grants_needed=grants,
+        security_grants_present=grants,
+    )
+
+    assert evaluation == AgentPermissionAlignment(
+        subject="research_agent",
+        tool_grants_needed=frozenset(grants),
+        security_grants_present=frozenset(grants),
+        missing_grants=frozenset(),
+        extra_grants=frozenset(),
+        aligned=True,
+    )
+
+
+def test_evaluate_agent_permission_alignment_reports_missing_grants_for_a_tool_with_no_permission():
+    engine = PolicyEngine()
+
+    evaluation = engine.evaluate_agent_permission_alignment(
+        subject="research_agent",
+        tool_grants_needed={("web_search", "search", "public_web")},
+        security_grants_present=set(),
+    )
+
+    assert evaluation.aligned is False
+    assert evaluation.missing_grants == frozenset(
+        {("web_search", "search", "public_web")}
+    )
+    assert evaluation.extra_grants == frozenset()
+
+
+def test_evaluate_agent_permission_alignment_reports_extra_grants_no_tool_needs():
+    engine = PolicyEngine()
+
+    evaluation = engine.evaluate_agent_permission_alignment(
+        subject="research_agent",
+        tool_grants_needed=set(),
+        security_grants_present={("shell", "execute", "workspace")},
+    )
+
+    assert evaluation.aligned is False
+    assert evaluation.missing_grants == frozenset()
+    assert evaluation.extra_grants == frozenset(
+        {("shell", "execute", "workspace")}
+    )
+
+
+def test_evaluate_agent_permission_alignment_rejects_empty_subject():
+    engine = PolicyEngine()
+
+    with pytest.raises(ValueError, match="subject must be"):
+        engine.evaluate_agent_permission_alignment(
+            subject="",
+            tool_grants_needed=set(),
+            security_grants_present=set(),
         )

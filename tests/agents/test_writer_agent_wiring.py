@@ -28,6 +28,7 @@ from core.agents.writer_agent import (
     run_writer_agent,
 )
 from core.policies.policy_engine import (
+    AgentPermissionAlignment,
     AgentScopeEvaluation,
     PolicyEngine,
 )
@@ -160,6 +161,35 @@ class _AlwaysOutOfScopePolicyEngine(PolicyEngine):
         )
 
 
+class _AlwaysMisalignedPolicyEngine(PolicyEngine):
+    """
+    A PolicyEngine stand-in whose evaluate_agent_permission_alignment()
+    always reports aligned=False -- mirrors
+    tests/agents/test_research_agent_wiring.py's own stand-in of the
+    same name, proving build_writer_agent() genuinely delegates to the
+    supplied policy_engine's config-side alignment check too (Build
+    Phase 10), not just its tool-id scope check (Build Phase 9).
+    """
+
+    def evaluate_agent_permission_alignment(
+        self,
+        *,
+        subject: str,
+        tool_grants_needed,
+        security_grants_present,
+    ) -> AgentPermissionAlignment:
+        needed = frozenset(tool_grants_needed)
+        present = frozenset(security_grants_present)
+        return AgentPermissionAlignment(
+            subject=subject,
+            tool_grants_needed=needed,
+            security_grants_present=present,
+            missing_grants=needed,
+            extra_grants=present,
+            aligned=False,
+        )
+
+
 def _make_findings_root(*, with_sample=True) -> str:
     root = tempfile.mkdtemp()
     if with_sample:
@@ -245,6 +275,29 @@ def test_build_writer_agent_raises_when_policy_engine_reports_out_of_scope():
                 findings_root=findings_root,
                 reports_root=reports_root,
                 policy_engine=_AlwaysOutOfScopePolicyEngine(),
+            )
+    finally:
+        shutil.rmtree(findings_root)
+        shutil.rmtree(reports_root)
+
+
+def test_build_writer_agent_raises_when_policy_engine_reports_misaligned_permissions():
+    """
+    Genuine delegation proof (Build Phase 10): mirrors
+    test_research_agent_wiring.py's equivalent test. With an otherwise
+    completely normal build against the real, aligned permissions.json,
+    injecting a policy_engine whose evaluate_agent_permission_alignment()
+    reports aligned=False must still make build_writer_agent() raise
+    ValueError.
+    """
+    findings_root = _make_findings_root()
+    reports_root = _make_reports_root()
+    try:
+        with pytest.raises(ValueError, match="drifted"):
+            build_writer_agent(
+                findings_root=findings_root,
+                reports_root=reports_root,
+                policy_engine=_AlwaysMisalignedPolicyEngine(),
             )
     finally:
         shutil.rmtree(findings_root)

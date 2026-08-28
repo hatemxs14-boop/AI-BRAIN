@@ -110,6 +110,32 @@ from core.security.engine.security_decision import (
 #                           responsibilities" had no artifact more
 #                           concrete than AgentIdentity.purpose (free
 #                           text, nothing enforced against then or now).
+#                           Build Phase 10 added a second, complementary
+#                           slice of the same "operate only within
+#                           declared responsibilities" bullet, from the
+#                           config side rather than the code side:
+#                           evaluate_agent_permission_alignment() checks
+#                           that permissions.json's actual grants for a
+#                           subject exactly match the (resource, action,
+#                           scope) tuples that subject's own registered
+#                           tools need -- catching both a registered
+#                           tool with no matching grant (every real call
+#                           to it would DENY, a functional drift the
+#                           tool-id check above cannot see, since it
+#                           only compares tool ids, never the underlying
+#                           permission grants) and a standing grant for
+#                           a resource/action/scope no registered tool
+#                           of that subject's needs at all (an unused,
+#                           least-privilege-violating grant). Both
+#                           build_research_agent() and
+#                           build_writer_agent() call this immediately
+#                           after evaluate_agent_scope() and raise the
+#                           same class of clear ValueError on
+#                           misalignment. Same build-time-only,
+#                           never-a-runtime-gate shape as
+#                           evaluate_agent_scope() -- see that method's
+#                           own reasoning below, which applies
+#                           identically here.
 #                           The REST of this section's bullets --
 #                           "use only authorized tools", "respect
 #                           memory access boundaries", "never bypass
@@ -243,6 +269,43 @@ class AgentScopeEvaluation:
     actual_tool_ids: frozenset[str]
     unauthorized_tool_ids: frozenset[str]
     within_scope: bool
+
+
+@dataclass(frozen=True)
+class AgentPermissionAlignment:
+    """
+    A second, complementary slice of POLICY_SPEC.md's Agent Constraints
+    "operate only within declared responsibilities" bullet (Build Phase
+    10), checked from the security-config side rather than the code
+    side evaluate_agent_scope() above already covers. Answers: do
+    permissions.json's actual grants for one subject exactly match the
+    (resource, action, scope) tuples that subject's own registered
+    tools need?
+
+    `missing_grants` -- tuples a registered tool needs but
+    permissions.json never grants this subject. If any exist, every
+    real call to that tool would be DENIED by the Security Layer
+    (ToolGateway/AuthorizationEngine) regardless of anything this
+    method does -- this only surfaces that drift at build time instead
+    of on the tool's first real use.
+
+    `extra_grants` -- tuples permissions.json grants this subject that
+    no registered tool of theirs needs at all. Not something the
+    Security Layer itself would ever refuse (nothing calls it), but a
+    standing, currently-unused permission is a least-privilege
+    violation the moment it exists -- POLICY_SPEC.md's "operate only
+    within declared responsibilities" is about what an agent is
+    *authorized* to do, not only what it happens to call today.
+
+    `aligned` is `not missing_grants and not extra_grants`.
+    """
+
+    subject: str
+    tool_grants_needed: frozenset[tuple[str, str, str]]
+    security_grants_present: frozenset[tuple[str, str, str]]
+    missing_grants: frozenset[tuple[str, str, str]]
+    extra_grants: frozenset[tuple[str, str, str]]
+    aligned: bool
 
 
 class PolicyEngine:
@@ -425,4 +488,49 @@ class PolicyEngine:
             actual_tool_ids=actual,
             unauthorized_tool_ids=unauthorized,
             within_scope=not unauthorized,
+        )
+
+    def evaluate_agent_permission_alignment(
+        self,
+        *,
+        subject: str,
+        tool_grants_needed: Iterable[tuple[str, str, str]],
+        security_grants_present: Iterable[tuple[str, str, str]],
+    ) -> AgentPermissionAlignment:
+        """
+        POLICY_SPEC.md's Agent Constraints, "operate only within
+        declared responsibilities" -- checked from the security-config
+        side (permissions.json's actual grants) rather than the code
+        side evaluate_agent_scope() above checks (ToolRegistry
+        registrations). See this module's own docstring (AGENT
+        CONSTRAINTS) and AgentPermissionAlignment's own docstring for
+        exactly what this covers.
+
+        Pure function of its inputs, same shape as evaluate_agent_scope()
+        and evaluate_external_action() above -- never inspects a live
+        AuthorizationEngine/policy file itself. Never raises for a
+        misalignment itself (`aligned=False` is just data); it is the
+        caller's choice whether that is fatal -- both
+        build_research_agent() and build_writer_agent() choose to raise
+        a ValueError immediately when it is, mirroring
+        evaluate_agent_scope()'s own established pattern.
+        """
+
+        if not isinstance(subject, str) or not subject.strip():
+            raise ValueError(
+                "subject must be a non-empty string."
+            )
+
+        needed = frozenset(tool_grants_needed)
+        present = frozenset(security_grants_present)
+        missing = needed - present
+        extra = present - needed
+
+        return AgentPermissionAlignment(
+            subject=subject,
+            tool_grants_needed=needed,
+            security_grants_present=present,
+            missing_grants=missing,
+            extra_grants=extra,
+            aligned=not missing and not extra,
         )

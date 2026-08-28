@@ -159,6 +159,17 @@ from core.tools.runtime.tool_runtime import (
 # change that silently registers a tool this agent's own spec doesn't
 # declare, per POLICY_SPEC.md's Agent Constraints ("never silently
 # expand their scope").
+#
+# Agent Constraints check (Build Phase 10): build_research_agent() also
+# calls PolicyEngine.evaluate_agent_permission_alignment() right after
+# constructing its SecurityDecisionPoint, comparing each registered
+# tool's (resource, action, scope) against permissions.json's real
+# grants for research_agent -- a second, config-side slice of the same
+# "operate only within declared responsibilities" bullet the tool-id
+# check above covers from the code side. See that method's own
+# docstring (core/policies/policy_engine.py) for exactly what this
+# catches and why it is safe under the "never so strict it can't
+# execute" constraint (build-time only, never a runtime gate).
 # ---------------------------------------------------------------------
 
 RESEARCH_AGENT_SUBJECT = "research_agent"
@@ -250,6 +261,35 @@ def build_research_agent(
         str(permissions_path),
         **security_kwargs,
     )
+
+    permission_alignment = policy_engine.evaluate_agent_permission_alignment(
+        subject=RESEARCH_AGENT_SUBJECT,
+        tool_grants_needed={
+            (tool.resource, tool.action, tool.scope)
+            for tool in registry.list_tools()
+        },
+        security_grants_present={
+            (permission.get("resource"), permission.get("action"), permission.get("scope"))
+            for permission in security.authorization_engine.policy.get(
+                "permissions", []
+            )
+            if isinstance(permission, dict)
+            and permission.get("subject") == RESEARCH_AGENT_SUBJECT
+        },
+    )
+
+    if not permission_alignment.aligned:
+        raise ValueError(
+            "research_agent's build_research_agent() has drifted from "
+            f"{permissions_path}: missing grant(s) "
+            f"{sorted(permission_alignment.missing_grants)} (a "
+            "registered tool needs these but permissions.json never "
+            "grants them -- every real call would be DENIED), extra "
+            f"grant(s) {sorted(permission_alignment.extra_grants)} (a "
+            "standing permission no registered tool needs at all). See "
+            "POLICY_SPEC.md's Agent Constraints ('operate only within "
+            "declared responsibilities')."
+        )
 
     gateway = ToolGateway(
         security=security,
