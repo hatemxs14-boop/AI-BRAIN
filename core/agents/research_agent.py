@@ -29,6 +29,10 @@ from core.llm.llm_client import (
     LLMClient,
 )
 
+from core.policies.policy_engine import (
+    PolicyEngine,
+)
+
 from core.security.engine.security_decision import (
     SecurityDecisionPoint,
 )
@@ -141,6 +145,20 @@ from core.tools.runtime.tool_runtime import (
 # for research_agent, it should be introduced as a new, explicitly
 # scoped/whitelisted tool with its own permission entry and its own
 # executor, not by restoring this one.
+#
+# Agent Constraints check (Build Phase 9): RESEARCH_AGENT_DECLARED_TOOL_IDS
+# below is this module's own explicit statement of the tool ids
+# RESEARCH_AGENT.md's "Tools > Allowed" section actually names as
+# allowed. build_research_agent() checks the real tool ids it just
+# registered against this declared set via
+# PolicyEngine.evaluate_agent_scope() (core/policies/policy_engine.py)
+# and raises immediately if they ever diverge -- see that method's own
+# docstring for exactly what this does and does not cover. This never
+# fires under normal operation (the registrations below are the only
+# ones this function ever performs); it exists to catch a future code
+# change that silently registers a tool this agent's own spec doesn't
+# declare, per POLICY_SPEC.md's Agent Constraints ("never silently
+# expand their scope").
 # ---------------------------------------------------------------------
 
 RESEARCH_AGENT_SUBJECT = "research_agent"
@@ -148,6 +166,15 @@ RESEARCH_AGENT_SUBJECT = "research_agent"
 DEFAULT_PERMISSIONS_PATH = "core/security/schemas/permissions.json"
 DEFAULT_DOCUMENTS_ROOT = "workspace/research_documents"
 DEFAULT_FINDINGS_ROOT = "workspace/research_findings"
+
+RESEARCH_AGENT_DECLARED_TOOL_IDS = frozenset(
+    {
+        WEB_SEARCH_TOOL_ID,
+        READ_DOCUMENT_TOOL_ID,
+        READ_WEBPAGE_TOOL_ID,
+        WRITE_RESEARCH_FINDINGS_TOOL_ID,
+    }
+)
 
 
 def build_research_agent(
@@ -157,6 +184,7 @@ def build_research_agent(
     serper_api_key: str | None = None,
     permissions_path: str | Path = DEFAULT_PERMISSIONS_PATH,
     audit_log_path: str | None = None,
+    policy_engine: PolicyEngine | None = None,
 ) -> AgentCore:
     """
     Assemble a fully wired research_agent AgentCore: real tools,
@@ -178,7 +206,15 @@ def build_research_agent(
     write_research_findings call still requires explicit approval
     regardless of this path (see this module's own docstring); this
     only controls WHERE an approved write is allowed to land.
+
+    `policy_engine` defaults to a fresh PolicyEngine() -- injected
+    mainly for tests that want to substitute or inspect it (see this
+    module's own docstring for the Agent Constraints check it performs
+    here).
     """
+
+    if policy_engine is None:
+        policy_engine = PolicyEngine()
 
     registry = ToolRegistry()
 
@@ -186,6 +222,24 @@ def build_research_agent(
     registry.register(READ_DOCUMENT_TOOL)
     registry.register(READ_WEBPAGE_TOOL)
     registry.register(WRITE_RESEARCH_FINDINGS_TOOL)
+
+    scope_evaluation = policy_engine.evaluate_agent_scope(
+        subject=RESEARCH_AGENT_SUBJECT,
+        declared_tool_ids=RESEARCH_AGENT_DECLARED_TOOL_IDS,
+        actual_tool_ids={tool.id for tool in registry.list_tools()},
+    )
+
+    if not scope_evaluation.within_scope:
+        raise ValueError(
+            "research_agent's build_research_agent() registered "
+            f"tool(s) {sorted(scope_evaluation.unauthorized_tool_ids)} "
+            "that are not declared in "
+            "RESEARCH_AGENT_DECLARED_TOOL_IDS -- this means the code "
+            "has silently expanded past what "
+            "core/agents/RESEARCH_AGENT.md's own 'Tools' section "
+            "declares as allowed. See POLICY_SPEC.md's Agent "
+            "Constraints ('never silently expand their scope')."
+        )
 
     security_kwargs: dict[str, Any] = {}
 

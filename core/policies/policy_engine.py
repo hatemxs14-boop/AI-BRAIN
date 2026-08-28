@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import Iterable
 
 from core.security.engine.security_decision import (
     SecurityDecision,
@@ -71,6 +72,57 @@ from core.security.engine.security_decision import (
 #                           level code, which is exactly where Build
 #                           Phase 7 wired it.)
 #
+#   AGENT CONSTRAINTS         real for one concrete, checkable slice of
+#                           this section as of Build Phase 9:
+#                           evaluate_agent_scope() answers "operate only
+#                           within declared responsibilities" / "never
+#                           silently expand their scope" for the one
+#                           artifact this project actually has that
+#                           states an agent's declared scope in a
+#                           checkable form -- each agent's own spec-
+#                           declared "Tools > Allowed" list (e.g.
+#                           RESEARCH_AGENT_DECLARED_TOOL_IDS in
+#                           core/agents/research_agent.py,
+#                           WRITER_AGENT_DECLARED_TOOL_IDS in
+#                           core/agents/writer_agent.py). Both
+#                           build_research_agent() and
+#                           build_writer_agent() call it immediately
+#                           after registering their tools, and raise a
+#                           clear ValueError if the tool ids actually
+#                           registered ever include one outside that
+#                           agent's own declared set -- the same
+#                           "silent drift becomes a loud, immediate
+#                           error" pattern Pass 4 finding L already
+#                           established for permissions.json's
+#                           defaults/risk_levels sections, applied here
+#                           one layer up (agent scope, not policy
+#                           config). This never affects any individual
+#                           request or tool call -- it is a build-time
+#                           self-consistency guard, not a runtime gate,
+#                           so it can never make a legitimate task
+#                           refuse to execute; it can only catch a
+#                           future code change that silently registers
+#                           a tool an agent's own spec doesn't declare.
+#                           This specific check was not buildable before
+#                           Build Phase 8: with only research_agent ever
+#                           registered, there was no second agent's
+#                           scope to compare against, and "declared
+#                           responsibilities" had no artifact more
+#                           concrete than AgentIdentity.purpose (free
+#                           text, nothing enforced against then or now).
+#                           The REST of this section's bullets --
+#                           "use only authorized tools", "respect
+#                           memory access boundaries", "never bypass
+#                           approval gates" -- are already enforced by
+#                           the hardened Security Layer (Passes 1-5) at
+#                           every actual tool call, independent of this
+#                           method; "follow verification requirements"
+#                           is already enforced by Kernel._verify()
+#                           (real since Build Phase 4). This method adds
+#                           a real check for the one specific gap those
+#                           mechanisms don't already cover, not a
+#                           restatement of what they already do.
+#
 #   FAILURE POLICY           real for the one step that was a bare,
 #                           unlabeled implementation detail before this
 #                           phase: is_recovery_authorized() is what
@@ -106,14 +158,6 @@ from core.security.engine.security_decision import (
 #
 # NOT IMPLEMENTED (documented, not fabricated):
 #
-#   AGENT CONSTRAINTS         Exactly one agent (research_agent) is
-#                           registered with the Kernel today; nothing
-#                           in this project yet distinguishes "declared
-#                           responsibilities" per agent beyond
-#                           AgentIdentity.purpose, a free-text
-#                           description nothing enforces against. Real
-#                           enforcement needs at least a second agent
-#                           to constrain something against.
 #   WORKFLOW CONSTRAINTS     No workflow concept exists in this
 #                           project. Kernel v1's STRATEGY SELECTION
 #                           step is currently a single-agent
@@ -174,6 +218,31 @@ class ExternalActionEvaluation:
     risk_level: str
     approval_required: bool
     verification_required: bool
+
+
+@dataclass(frozen=True)
+class AgentScopeEvaluation:
+    """
+    Answers POLICY_SPEC.md's Agent Constraints "operate only within
+    declared responsibilities" / "never silently expand their scope"
+    for one agent's tool registrations, checked against that same
+    agent's own spec-declared tool-id set.
+
+    `unauthorized_tool_ids` is `actual_tool_ids - declared_tool_ids` --
+    empty when the agent registered nothing outside its own declared
+    scope. `within_scope` is `not unauthorized_tool_ids`, kept as its
+    own field (rather than requiring every caller to re-derive it) so
+    a caller only needs the one boolean it actually wants: a caller
+    building the agent asks "is this build allowed to succeed?"
+    (`within_scope`), while a caller diagnosing a violation asks
+    "which tool ids exactly?" (`unauthorized_tool_ids`).
+    """
+
+    subject: str
+    declared_tool_ids: frozenset[str]
+    actual_tool_ids: frozenset[str]
+    unauthorized_tool_ids: frozenset[str]
+    within_scope: bool
 
 
 class PolicyEngine:
@@ -311,4 +380,49 @@ class PolicyEngine:
             # reflecting that actual behavior rather than a
             # risk-dependent rule that doesn't exist yet.
             verification_required=True,
+        )
+
+    def evaluate_agent_scope(
+        self,
+        *,
+        subject: str,
+        declared_tool_ids: Iterable[str],
+        actual_tool_ids: Iterable[str],
+    ) -> AgentScopeEvaluation:
+        """
+        POLICY_SPEC.md's Agent Constraints: "operate only within their
+        declared responsibilities" / "never silently expand their
+        scope", answered for one agent's real tool registrations
+        against that agent's own spec-declared tool-id set. See this
+        module's own docstring (AGENT CONSTRAINTS) for exactly what
+        this does and does not cover, and AgentScopeEvaluation's own
+        docstring for the returned fields.
+
+        This is a pure function of its inputs -- it never inspects a
+        live ToolRegistry/AgentCore itself, the same "caller supplies
+        already-computed data, this method only evaluates it" shape
+        already established by evaluate_external_action() above. Never
+        raises for a scope violation itself (`within_scope=False` is
+        just data); it is the caller's choice whether an out-of-scope
+        registration is fatal -- both build_research_agent() and
+        build_writer_agent() (core/agents/research_agent.py,
+        core/agents/writer_agent.py) choose to raise a ValueError
+        immediately when it is, per this module's own docstring.
+        """
+
+        if not isinstance(subject, str) or not subject.strip():
+            raise ValueError(
+                "subject must be a non-empty string."
+            )
+
+        declared = frozenset(declared_tool_ids)
+        actual = frozenset(actual_tool_ids)
+        unauthorized = actual - declared
+
+        return AgentScopeEvaluation(
+            subject=subject,
+            declared_tool_ids=declared,
+            actual_tool_ids=actual,
+            unauthorized_tool_ids=unauthorized,
+            within_scope=not unauthorized,
         )

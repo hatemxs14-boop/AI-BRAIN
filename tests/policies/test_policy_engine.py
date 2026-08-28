@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from core.policies.policy_engine import (
+    AgentScopeEvaluation,
     ExternalActionEvaluation,
     PolicyEngine,
     PolicyLevel,
@@ -315,4 +316,68 @@ def test_evaluate_external_action_rejects_a_security_decision_missing_entirely()
             subject="research_agent",
             tool_id="web_search",
             security_decision="not a real SecurityDecision",
+        )
+
+
+# ---------------------------------------------------------------------
+# evaluate_agent_scope (Agent Constraints -- declared tool-id scope,
+# Build Phase 9). See core/policies/policy_engine.py's own module
+# docstring and core/agents/research_agent.py / writer_agent.py's own
+# docstrings for what this check does and does not cover.
+# ---------------------------------------------------------------------
+
+def test_evaluate_agent_scope_reports_within_scope_when_actual_tools_match_declared():
+    engine = PolicyEngine()
+
+    evaluation = engine.evaluate_agent_scope(
+        subject="research_agent",
+        declared_tool_ids={"web_search", "read_document"},
+        actual_tool_ids={"web_search", "read_document"},
+    )
+
+    assert evaluation == AgentScopeEvaluation(
+        subject="research_agent",
+        declared_tool_ids=frozenset({"web_search", "read_document"}),
+        actual_tool_ids=frozenset({"web_search", "read_document"}),
+        unauthorized_tool_ids=frozenset(),
+        within_scope=True,
+    )
+
+
+def test_evaluate_agent_scope_reports_within_scope_when_actual_tools_are_a_strict_subset_of_declared():
+    # Declaring a tool never requires actually registering it -- only
+    # registering something UNDECLARED is a scope violation.
+    engine = PolicyEngine()
+
+    evaluation = engine.evaluate_agent_scope(
+        subject="research_agent",
+        declared_tool_ids={"web_search", "read_document", "read_webpage"},
+        actual_tool_ids={"web_search"},
+    )
+
+    assert evaluation.within_scope is True
+    assert evaluation.unauthorized_tool_ids == frozenset()
+
+
+def test_evaluate_agent_scope_reports_unauthorized_tools_when_actual_exceeds_declared():
+    engine = PolicyEngine()
+
+    evaluation = engine.evaluate_agent_scope(
+        subject="research_agent",
+        declared_tool_ids={"web_search"},
+        actual_tool_ids={"web_search", "shell"},
+    )
+
+    assert evaluation.within_scope is False
+    assert evaluation.unauthorized_tool_ids == frozenset({"shell"})
+
+
+def test_evaluate_agent_scope_rejects_empty_subject():
+    engine = PolicyEngine()
+
+    with pytest.raises(ValueError, match="subject must be"):
+        engine.evaluate_agent_scope(
+            subject="   ",
+            declared_tool_ids={"web_search"},
+            actual_tool_ids={"web_search"},
         )

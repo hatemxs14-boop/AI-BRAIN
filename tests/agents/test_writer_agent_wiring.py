@@ -27,6 +27,10 @@ from core.agents.writer_agent import (
     build_writer_agent,
     run_writer_agent,
 )
+from core.policies.policy_engine import (
+    AgentScopeEvaluation,
+    PolicyEngine,
+)
 
 
 class _ReadFindingThenCompleteEngine(AgentDecisionEngine):
@@ -129,6 +133,33 @@ class _RequestUnavailableShellEngine(AgentDecisionEngine):
         )
 
 
+class _AlwaysOutOfScopePolicyEngine(PolicyEngine):
+    """
+    A PolicyEngine stand-in whose evaluate_agent_scope() always reports
+    within_scope=False -- mirrors
+    tests/agents/test_research_agent_wiring.py's own stand-in of the
+    same name, proving build_writer_agent() genuinely delegates to the
+    supplied policy_engine rather than always trusting its own
+    registrations.
+    """
+
+    def evaluate_agent_scope(
+        self,
+        *,
+        subject: str,
+        declared_tool_ids,
+        actual_tool_ids,
+    ) -> AgentScopeEvaluation:
+        actual = frozenset(actual_tool_ids)
+        return AgentScopeEvaluation(
+            subject=subject,
+            declared_tool_ids=frozenset(declared_tool_ids),
+            actual_tool_ids=actual,
+            unauthorized_tool_ids=actual,
+            within_scope=False,
+        )
+
+
 def _make_findings_root(*, with_sample=True) -> str:
     root = tempfile.mkdtemp()
     if with_sample:
@@ -196,6 +227,28 @@ def test_build_writer_agent_raises_clear_error_for_missing_reports_root():
             )
     finally:
         shutil.rmtree(findings_root)
+
+
+def test_build_writer_agent_raises_when_policy_engine_reports_out_of_scope():
+    """
+    Genuine delegation proof (Build Phase 9): mirrors
+    test_research_agent_wiring.py's equivalent test. With an otherwise
+    completely normal build, injecting a policy_engine whose
+    evaluate_agent_scope() reports within_scope=False must still make
+    build_writer_agent() raise ValueError.
+    """
+    findings_root = _make_findings_root()
+    reports_root = _make_reports_root()
+    try:
+        with pytest.raises(ValueError, match="silently expanded"):
+            build_writer_agent(
+                findings_root=findings_root,
+                reports_root=reports_root,
+                policy_engine=_AlwaysOutOfScopePolicyEngine(),
+            )
+    finally:
+        shutil.rmtree(findings_root)
+        shutil.rmtree(reports_root)
 
 
 # ---------------------------------------------------------------------

@@ -37,6 +37,10 @@ from core.agents.research_agent import (
     build_research_agent,
     run_research_agent,
 )
+from core.policies.policy_engine import (
+    AgentScopeEvaluation,
+    PolicyEngine,
+)
 
 
 class _ReadDocumentThenCompleteEngine(AgentDecisionEngine):
@@ -180,6 +184,34 @@ class _RequestUnavailableShellEngine(AgentDecisionEngine):
         )
 
 
+class _AlwaysOutOfScopePolicyEngine(PolicyEngine):
+    """
+    A PolicyEngine stand-in whose evaluate_agent_scope() always reports
+    within_scope=False, regardless of what is actually declared/
+    registered -- injected to prove build_research_agent() genuinely
+    delegates to the supplied policy_engine and acts on its verdict,
+    rather than always trusting its own registrations (mirrors this
+    project's established genuine-delegation test pattern, e.g. the
+    _should_recover()/_evaluate_policy() stand-ins used elsewhere).
+    """
+
+    def evaluate_agent_scope(
+        self,
+        *,
+        subject: str,
+        declared_tool_ids,
+        actual_tool_ids,
+    ) -> AgentScopeEvaluation:
+        actual = frozenset(actual_tool_ids)
+        return AgentScopeEvaluation(
+            subject=subject,
+            declared_tool_ids=frozenset(declared_tool_ids),
+            actual_tool_ids=actual,
+            unauthorized_tool_ids=actual,
+            within_scope=False,
+        )
+
+
 def _make_documents_root(*, with_sample=True) -> str:
     root = tempfile.mkdtemp()
     if with_sample:
@@ -245,6 +277,31 @@ def test_build_research_agent_raises_clear_error_for_missing_documents_root():
             documents_root="/no/such/directory/anywhere",
             serper_api_key="test-key",
         )
+
+
+def test_build_research_agent_raises_when_policy_engine_reports_out_of_scope():
+    """
+    Genuine delegation proof (Build Phase 9): with an otherwise
+    completely normal build -- real, valid documents_root/findings_root,
+    real Serper key -- injecting a policy_engine whose
+    evaluate_agent_scope() reports within_scope=False must still make
+    build_research_agent() raise ValueError. This proves the scope
+    check actually asks the supplied policy_engine and acts on its
+    answer, rather than the raise being unreachable dead code.
+    """
+    docs_root = _make_documents_root()
+    findings_root = _make_findings_root()
+    try:
+        with pytest.raises(ValueError, match="silently expanded"):
+            build_research_agent(
+                documents_root=docs_root,
+                findings_root=findings_root,
+                serper_api_key="test-key",
+                policy_engine=_AlwaysOutOfScopePolicyEngine(),
+            )
+    finally:
+        shutil.rmtree(docs_root)
+        shutil.rmtree(findings_root)
 
 
 # ---------------------------------------------------------------------

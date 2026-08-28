@@ -29,6 +29,10 @@ from core.llm.llm_client import (
     LLMClient,
 )
 
+from core.policies.policy_engine import (
+    PolicyEngine,
+)
+
 from core.security.engine.security_decision import (
     SecurityDecisionPoint,
 )
@@ -106,6 +110,16 @@ from core.tools.runtime.tool_runtime import (
 # to workspace/research_findings/ (research_agent's own output) --
 # each agent's tools and permissions are its own, per AGENT_REGISTRY.md's
 # Boundaries ("must not access memory outside its declared scope").
+#
+# Agent Constraints check (Build Phase 9): WRITER_AGENT_DECLARED_TOOL_IDS
+# below is this module's own explicit statement of the tool ids
+# WRITER_AGENT.md's "Tools > Allowed" section actually names as
+# allowed. build_writer_agent() checks the real tool ids it just
+# registered against this declared set via
+# PolicyEngine.evaluate_agent_scope() (core/policies/policy_engine.py)
+# and raises immediately if they ever diverge -- see that method's own
+# docstring, and core/agents/research_agent.py's identical check, for
+# exactly what this does and does not cover.
 # ---------------------------------------------------------------------
 
 WRITER_AGENT_SUBJECT = "writer_agent"
@@ -114,6 +128,13 @@ DEFAULT_PERMISSIONS_PATH = "core/security/schemas/permissions.json"
 DEFAULT_FINDINGS_ROOT = "workspace/research_findings"
 DEFAULT_REPORTS_ROOT = "workspace/reports"
 
+WRITER_AGENT_DECLARED_TOOL_IDS = frozenset(
+    {
+        READ_RESEARCH_FINDINGS_TOOL_ID,
+        WRITE_REPORT_TOOL_ID,
+    }
+)
+
 
 def build_writer_agent(
     *,
@@ -121,6 +142,7 @@ def build_writer_agent(
     reports_root: str | Path = DEFAULT_REPORTS_ROOT,
     permissions_path: str | Path = DEFAULT_PERMISSIONS_PATH,
     audit_log_path: str | None = None,
+    policy_engine: PolicyEngine | None = None,
 ) -> AgentCore:
     """
     Assemble a fully wired writer_agent AgentCore: real tools, real
@@ -139,12 +161,37 @@ def build_writer_agent(
     call still requires explicit approval regardless of this path (see
     this module's own docstring); this only controls WHERE an approved
     write is allowed to land.
+
+    `policy_engine` defaults to a fresh PolicyEngine() -- injected
+    mainly for tests that want to substitute or inspect it (see this
+    module's own docstring for the Agent Constraints check it performs
+    here).
     """
+
+    if policy_engine is None:
+        policy_engine = PolicyEngine()
 
     registry = ToolRegistry()
 
     registry.register(READ_RESEARCH_FINDINGS_TOOL)
     registry.register(WRITE_REPORT_TOOL)
+
+    scope_evaluation = policy_engine.evaluate_agent_scope(
+        subject=WRITER_AGENT_SUBJECT,
+        declared_tool_ids=WRITER_AGENT_DECLARED_TOOL_IDS,
+        actual_tool_ids={tool.id for tool in registry.list_tools()},
+    )
+
+    if not scope_evaluation.within_scope:
+        raise ValueError(
+            "writer_agent's build_writer_agent() registered tool(s) "
+            f"{sorted(scope_evaluation.unauthorized_tool_ids)} that "
+            "are not declared in WRITER_AGENT_DECLARED_TOOL_IDS -- "
+            "this means the code has silently expanded past what "
+            "core/agents/WRITER_AGENT.md's own 'Tools' section "
+            "declares as allowed. See POLICY_SPEC.md's Agent "
+            "Constraints ('never silently expand their scope')."
+        )
 
     security_kwargs: dict[str, Any] = {}
 
