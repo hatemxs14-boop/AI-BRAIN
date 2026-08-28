@@ -32,6 +32,7 @@ from core.kernel.kernel import (
     AgentRegistration,
     Kernel,
     NormalizedTask,
+    WorkflowVerifierRegistration,
 )
 
 from core.llm.llm_client import (
@@ -106,6 +107,18 @@ from core.policies.policy_engine import (
 # from _WRITER_AGENT_KEYWORDS entirely -- writer_agent is now reached
 # only by its own drafting/publishing verbs, and reviewer_agent's own
 # verification verbs no longer collide with it.
+#
+# Build Phase 12 gave this Kernel its first real Workflow Constraints
+# capability (core/policies/policy_engine.py's evaluate_workflow_
+# trigger(), Kernel._trigger_independent_verification): an opt-in
+# `enable_independent_verification` flag that, when True, registers
+# reviewer_agent as this Kernel's `independent_verifier`, so a
+# SUCCESSful writer_agent write_report call automatically triggers a
+# real reviewer_agent run afterward. Defaults to False -- CLASSIFY/
+# _select_agent's own single-agent-per-task selection mechanism is
+# completely unchanged by this; it only adds an optional, purely
+# additive extra step after a specific completed action, never a new
+# way to select the *primary* agent for a task.
 # ---------------------------------------------------------------------
 
 
@@ -216,6 +229,7 @@ def build_default_kernel(
     orchestration_engine: OrchestrationEngine | None = None,
     max_recovery_attempts: int = 1,
     policy_engine: PolicyEngine | None = None,
+    enable_independent_verification: bool = False,
 ) -> Kernel:
     """
     Build a Kernel with research_agent, writer_agent, and
@@ -255,6 +269,20 @@ def build_default_kernel(
     `policy_engine` is passed straight through to Kernel() -- see its
     own docstring (core/kernel/kernel.py). Defaults to a fresh
     PolicyEngine() when not supplied.
+
+    `enable_independent_verification` (Build Phase 12, default False)
+    opts into Kernel's new Workflow Constraints capability: when True,
+    a fresh reviewer_agent is registered as this Kernel's
+    `independent_verifier` (WorkflowVerifierRegistration), so a
+    SUCCESSful writer_agent write_report call automatically triggers a
+    real reviewer_agent run afterward, surfaced on
+    KernelResult.independent_verification -- see Kernel.__init__'s own
+    docstring and core/policies/policy_engine.py's WORKFLOW CONSTRAINTS
+    section for exactly what this does and does not cover. Defaults to
+    False so this Kernel's behavior, cost (an extra agent/decision-
+    engine run, potentially an extra LLM call in production), and
+    every existing caller's test counts are completely unchanged unless
+    a caller explicitly opts in.
     """
 
     if decision_engine_factory is None:
@@ -308,10 +336,21 @@ def build_default_kernel(
             audit_log_path=audit_log_path,
         )
 
+    independent_verifier = (
+        WorkflowVerifierRegistration(
+            subject="reviewer_agent",
+            build_agent=build_reviewer,
+            build_decision_engine=decision_engine_factory,
+        )
+        if enable_independent_verification
+        else None
+    )
+
     kernel = Kernel(
         orchestration_engine=orchestration_engine,
         max_recovery_attempts=max_recovery_attempts,
         policy_engine=policy_engine,
+        independent_verifier=independent_verifier,
     )
 
     kernel.register_agent(

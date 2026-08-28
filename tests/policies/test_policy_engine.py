@@ -20,6 +20,7 @@ from core.policies.policy_engine import (
     ExternalActionEvaluation,
     PolicyEngine,
     PolicyLevel,
+    WorkflowTriggerEvaluation,
 )
 
 from core.security.engine.security_decision import (
@@ -453,4 +454,99 @@ def test_evaluate_agent_permission_alignment_rejects_empty_subject():
             subject="",
             tool_grants_needed=set(),
             security_grants_present=set(),
+        )
+
+
+# ---------------------------------------------------------------------
+# evaluate_workflow_trigger() -- POLICY_SPEC.md's Workflow Constraints,
+# v1 (Build Phase 12). See policy_engine.py's own module docstring
+# (WORKFLOW CONSTRAINTS) for exactly what this one declared transition
+# covers and does not.
+# ---------------------------------------------------------------------
+
+def test_evaluate_workflow_trigger_triggers_reviewer_agent_after_a_successful_write_report():
+    engine = PolicyEngine()
+
+    evaluation = engine.evaluate_workflow_trigger(
+        completed_subject="writer_agent",
+        tool_id="write_report",
+        tool_status="SUCCESS",
+    )
+
+    assert evaluation == WorkflowTriggerEvaluation(
+        completed_subject="writer_agent",
+        tool_id="write_report",
+        tool_status="SUCCESS",
+        should_trigger=True,
+        next_subject="reviewer_agent",
+    )
+
+
+def test_evaluate_workflow_trigger_does_not_trigger_for_a_denied_write_report():
+    """
+    Only a SUCCESSful write_report is a real, published report worth
+    independently verifying -- a DENIED/APPROVAL_REQUIRED/ERROR result
+    never actually wrote anything, so there is nothing yet for
+    reviewer_agent to review.
+    """
+    engine = PolicyEngine()
+
+    evaluation = engine.evaluate_workflow_trigger(
+        completed_subject="writer_agent",
+        tool_id="write_report",
+        tool_status="DENIED",
+    )
+
+    assert evaluation.should_trigger is False
+    assert evaluation.next_subject is None
+
+
+def test_evaluate_workflow_trigger_does_not_trigger_for_an_unrelated_subject_or_tool():
+    """
+    research_agent's own write_research_findings is a different
+    (subject, tool_id) pair entirely -- no transition is declared for
+    it (see this project's own reasoning, in policy_engine.py's module
+    docstring, for why research_agent -> writer_agent is deliberately
+    not auto-triggered).
+    """
+    engine = PolicyEngine()
+
+    evaluation = engine.evaluate_workflow_trigger(
+        completed_subject="research_agent",
+        tool_id="write_research_findings",
+        tool_status="SUCCESS",
+    )
+
+    assert evaluation.should_trigger is False
+    assert evaluation.next_subject is None
+
+
+def test_evaluate_workflow_trigger_never_raises_when_tool_id_or_status_are_none():
+    """
+    A completed run that never invoked a tool at all has no tool_id/
+    tool_status to report -- this must degrade to "no transition",
+    never raise, mirroring the duck-typed tolerance
+    evaluate_external_action()/Kernel._evaluate_policy already
+    establish for similarly incomplete data.
+    """
+    engine = PolicyEngine()
+
+    evaluation = engine.evaluate_workflow_trigger(
+        completed_subject="writer_agent",
+        tool_id=None,
+        tool_status=None,
+    )
+
+    assert evaluation.should_trigger is False
+    assert evaluation.next_subject is None
+
+
+def test_evaluate_workflow_trigger_rejects_empty_completed_subject():
+    engine = PolicyEngine()
+
+    with pytest.raises(ValueError, match="completed_subject must be"):
+        engine.evaluate_workflow_trigger(
+            completed_subject="",
+            tool_id="write_report",
+            tool_status="SUCCESS",
         )

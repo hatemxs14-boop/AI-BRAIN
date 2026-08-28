@@ -182,15 +182,49 @@ from core.security.engine.security_decision import (
 #                           consistently avoided (see Kernel v1's own
 #                           docstring).
 #
+#   WORKFLOW CONSTRAINTS     real for one concrete, narrow slice as of
+#                           Build Phase 12: evaluate_workflow_trigger()
+#                           answers exactly one question -- after one
+#                           agent's action completes, should a second,
+#                           specific agent be triggered next? -- for a
+#                           single, explicitly hand-declared transition
+#                           (_WORKFLOW_TRANSITIONS): a SUCCESSful
+#                           writer_agent write_report call triggers
+#                           reviewer_agent, matching AGENT_REGISTRY.md's
+#                           own Collaboration section ("independent
+#                           verification provides meaningful value" is
+#                           one of its four explicit reasons multiple
+#                           agents may be selected). This is real,
+#                           inspectable Workflow-level policy -- the
+#                           first of its kind in this project -- but it
+#                           is deliberately NOT a general multi-step/
+#                           multi-agent planner: Kernel v1's STRATEGY
+#                           SELECTION step (core/kernel/kernel.py) is
+#                           still a single-agent passthrough for the
+#                           *primary* task; this only decides whether
+#                           to trigger one specific, fully read-only,
+#                           LOW-risk *secondary* agent (reviewer_agent)
+#                           as a purely additive, inspectable extra step
+#                           (Kernel._trigger_independent_verification /
+#                           KernelResult.independent_verification --
+#                           never gates or changes the primary task's
+#                           own status). Deliberately does NOT also
+#                           auto-trigger writer_agent after
+#                           research_agent persists a finding: that
+#                           would mean automatically choosing to
+#                           publish a HIGH-risk, approval-gated report
+#                           without a human ever asking for one, which
+#                           risks exactly the "never silently make
+#                           irreversible decisions" violation
+#                           KERNEL_SPEC.md warns against -- triggering a
+#                           fully read-only, LOW-risk verification step
+#                           carries no such risk. A real, general
+#                           multi-step/multi-agent plan (ranking
+#                           candidates, parallel execution, arbitrary
+#                           chains) remains future work.
+#
 # NOT IMPLEMENTED (documented, not fabricated):
 #
-#   WORKFLOW CONSTRAINTS     No workflow concept exists in this
-#                           project. Kernel v1's STRATEGY SELECTION
-#                           step is currently a single-agent
-#                           passthrough (see core/kernel/kernel.py) --
-#                           there is no multi-step, multi-agent plan
-#                           yet for a workflow-level constraint to
-#                           apply to.
 #   MEMORY CONSTRAINTS       No memory layer exists in this project
 #                           (see Kernel v1's CONTEXT RETRIEVAL/PERSIST/
 #                           LEARN no-ops) -- there is nothing yet for
@@ -308,6 +342,34 @@ class AgentPermissionAlignment:
     aligned: bool
 
 
+@dataclass(frozen=True)
+class WorkflowTriggerEvaluation:
+    """
+    POLICY_SPEC.md's Workflow Constraints (Build Phase 12): after one
+    agent's action completes, should a second, specific agent be
+    triggered next? See this module's own docstring (WORKFLOW
+    CONSTRAINTS) for exactly what this does and does not cover -- one
+    single, explicitly hand-declared transition, not a general
+    multi-agent planner.
+
+    `tool_id`/`tool_status` describe the just-completed action (the
+    last tool call `completed_subject`'s run actually made) -- both may
+    be `None` (e.g. the agent completed without ever calling a tool),
+    in which case `should_trigger` is always `False`.
+
+    `should_trigger` is `next_subject is not None`. `next_subject` is
+    the subject that should be triggered next, or `None` when this
+    exact (completed_subject, tool_id, tool_status) combination has no
+    declared transition.
+    """
+
+    completed_subject: str
+    tool_id: str | None
+    tool_status: str | None
+    should_trigger: bool
+    next_subject: str | None
+
+
 class PolicyEngine:
     """
     Real (v1) implementation of core/policies/POLICY_SPEC.md. See this
@@ -327,6 +389,19 @@ class PolicyEngine:
     RECOVERY_AUTHORIZED_STATUSES = frozenset(
         {"DECISION_ERROR", "EXECUTION_ERROR"}
     )
+
+    # POLICY_SPEC.md's Workflow Constraints, v1 (Build Phase 12): the
+    # one and only declared (completed_subject, tool_id, tool_status)
+    # -> next_subject transition in this project so far. Keyed on the
+    # exact tuple rather than e.g. "any writer_agent SUCCESS" so a
+    # future second transition can be added without touching
+    # evaluate_workflow_trigger()'s own logic -- see this module's own
+    # docstring (WORKFLOW CONSTRAINTS) for why only this one transition
+    # exists today and why research_agent -> writer_agent is
+    # deliberately NOT also declared here.
+    _WORKFLOW_TRANSITIONS: dict[tuple[str, str, str], str] = {
+        ("writer_agent", "write_report", "SUCCESS"): "reviewer_agent",
+    }
 
     def is_recovery_authorized(
         self,
@@ -533,4 +608,59 @@ class PolicyEngine:
             missing_grants=missing,
             extra_grants=extra,
             aligned=not missing and not extra,
+        )
+
+    def evaluate_workflow_trigger(
+        self,
+        *,
+        completed_subject: str,
+        tool_id: str | None,
+        tool_status: str | None,
+    ) -> WorkflowTriggerEvaluation:
+        """
+        POLICY_SPEC.md's Workflow Constraints (Build Phase 12): should
+        a second, specific agent be triggered now that
+        `completed_subject`'s run just completed one particular tool
+        action? See this module's own docstring (WORKFLOW CONSTRAINTS)
+        and WorkflowTriggerEvaluation's own docstring for exactly what
+        this does and does not cover.
+
+        Pure function of its inputs, same shape as
+        evaluate_agent_scope()/evaluate_agent_permission_alignment()/
+        evaluate_external_action() above -- never inspects a live
+        AgentLoopResult/ToolExecutionResult itself; the caller (Kernel.
+        _trigger_independent_verification, core/kernel/kernel.py)
+        extracts `tool_id`/`tool_status` from the real result first.
+        `tool_id`/`tool_status` may be `None` (e.g. the agent completed
+        without ever calling a tool) -- this simply never matches a
+        declared transition, `should_trigger` is `False`, and this
+        method does not raise for that case (the same "duck-typed,
+        degrade rather than crash on incomplete data" tolerance
+        `Kernel._evaluate_policy` already established for its own
+        caller-supplied data -- see core/kernel/kernel.py).
+
+        Never raises for "no transition applies" (`should_trigger=False`
+        is just data); it is the caller's choice whether/how to act on
+        a triggered transition -- Kernel._trigger_independent_verification
+        chooses to actually run the named next agent, but only when it
+        also has a real WorkflowVerifierRegistration configured for
+        that exact subject (see that method's own docstring for why an
+        unconfigured Kernel silently does nothing here, never raises).
+        """
+
+        if not isinstance(completed_subject, str) or not completed_subject.strip():
+            raise ValueError(
+                "completed_subject must be a non-empty string."
+            )
+
+        next_subject = self._WORKFLOW_TRANSITIONS.get(
+            (completed_subject, tool_id, tool_status)
+        )
+
+        return WorkflowTriggerEvaluation(
+            completed_subject=completed_subject,
+            tool_id=tool_id,
+            tool_status=tool_status,
+            should_trigger=next_subject is not None,
+            next_subject=next_subject,
         )

@@ -31,6 +31,7 @@ from core.kernel.kernel import (
     Kernel,
     KernelVerification,
     NormalizedTask,
+    WorkflowVerifierRegistration,
 )
 
 from core.orchestration.orchestration_engine import (
@@ -40,6 +41,7 @@ from core.orchestration.orchestration_engine import (
 from core.policies.policy_engine import (
     ExternalActionEvaluation,
     PolicyEngine,
+    WorkflowTriggerEvaluation,
 )
 
 from core.security.engine.security_decision import SecurityDecisionPoint
@@ -201,6 +203,149 @@ def _build_low_risk_tool_agent(tmp_dir: Path, subject: str = "test_agent") -> Ag
     )
 
     return AgentCore(identity=identity, tools=interface)
+
+
+def _write_write_report_policy(
+    tmp_dir: Path, subject: str = "writer_agent"
+) -> Path:
+    """
+    A synthetic LOW-risk/no-approval permission for a fake "write_report"
+    tool, isolated to `tmp_dir` -- same isolation pattern as every other
+    _write_*_policy helper in this file. LOW/none (rather than the real
+    write_report tool's actual HIGH/policy) is a deliberate
+    simplification here: these Kernel-level tests exist to exercise
+    _trigger_independent_verification's own mechanics (Build Phase 12),
+    not the approval gate itself, which tests/tools/implementations/
+    test_write_report_tool.py already covers directly.
+    """
+
+    policy = {
+        "version": "1.0",
+        "permissions": [
+            {
+                "subject": subject,
+                "resource": "report",
+                "action": "write",
+                "scope": "workspace",
+                "risk_level": "LOW",
+                "approval": "none",
+            }
+        ],
+        "defaults": {
+            "unknown_risk": "DENY",
+            "unknown_permission": "DENY",
+            "unknown_scope": "DENY",
+            "authorization_failure": "DENY",
+        },
+    }
+    policy_path = tmp_dir / "permissions.json"
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    return policy_path
+
+
+def _build_write_report_tool_agent(
+    tmp_dir: Path, subject: str = "writer_agent"
+) -> AgentCore:
+    """
+    A real, LOW-risk, auto-allowed "write_report"-id tool whose
+    executor returns a real `{"path": ..., "size_bytes": ...}` artifact
+    -- the exact shape the real write_report tool's own executor
+    returns (core/tools/implementations/write_report_tool.py) -- so a
+    resulting ToolExecutionResult.artifacts[0] exercises
+    Kernel._trigger_independent_verification's own artifact-path
+    extraction the same way the real tool would, without needing the
+    real tool's sandboxing/approval machinery here.
+    """
+
+    registry = ToolRegistry()
+
+    registry.register(
+        ToolDefinition(
+            id="write_report",
+            name="Write Report",
+            purpose="Publish a written report.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["filename", "content"],
+                "additionalProperties": False,
+            },
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "size_bytes": {"type": "integer"},
+                },
+                "required": ["path", "size_bytes"],
+            },
+            permissions=(f"{subject}:report:write:workspace",),
+            resource="report",
+            action="write",
+            scope="workspace",
+            risk_level="LOW",
+            error_handling={
+                "retryable": False,
+                "on_failure": "Surface the write error to the agent.",
+            },
+        )
+    )
+
+    policy_path = _write_write_report_policy(tmp_dir, subject=subject)
+
+    security = SecurityDecisionPoint(
+        policy_path=str(policy_path),
+        audit_log_path=str(tmp_dir / "audit.jsonl"),
+    )
+
+    gateway = ToolGateway(security=security, registry=registry)
+    gateway.register_executor(
+        tool_id="write_report",
+        executor=lambda filename, content: {
+            "path": filename,
+            "size_bytes": len(content.encode("utf-8")),
+        },
+    )
+
+    runtime = ToolRuntime(registry=registry, gateway=gateway)
+    interface = AgentToolInterface(runtime=runtime)
+
+    identity = AgentIdentity(
+        subject=subject,
+        name="Test Agent",
+        purpose="A minimal agent used only to exercise Kernel mechanics.",
+    )
+
+    return AgentCore(identity=identity, tools=interface)
+
+
+class _WriteReportThenCompleteEngine(AgentDecisionEngine):
+    """Invokes write_report exactly once, then completes."""
+
+    def __init__(self, *, filename: str = "report.md"):
+        self._invoked = False
+        self._filename = filename
+
+    def decide(self, context):
+        if not self._invoked:
+            self._invoked = True
+
+            return AgentAction(
+                action_type=AgentActionType.INVOKE_TOOL,
+                tool_id="write_report",
+                inputs={
+                    "filename": self._filename,
+                    "content": "# Report\n\nContent.",
+                },
+                reason="Publish before completing.",
+            )
+
+        return AgentAction(
+            action_type=AgentActionType.COMPLETE,
+            reason="Report published.",
+        )
 
 
 class _SearchThenCompleteEngine(AgentDecisionEngine):
@@ -1025,3 +1170,310 @@ def test_evaluate_policy_genuinely_delegates_to_the_injected_policy_engine():
         approval_required=True,
         verification_required=False,
     )
+
+
+# ---------------------------------------------------------------------
+# WorkflowVerifierRegistration -- Build Phase 12's own registration
+# dataclass, validated the same way AgentRegistration.__post_init__ is.
+# ---------------------------------------------------------------------
+
+def test_workflow_verifier_registration_rejects_empty_subject():
+    with pytest.raises(ValueError, match="subject must be"):
+        WorkflowVerifierRegistration(
+            subject="",
+            build_agent=lambda: None,
+            build_decision_engine=lambda: None,
+        )
+
+
+def test_workflow_verifier_registration_rejects_non_callable_build_agent():
+    with pytest.raises(TypeError, match="build_agent must be"):
+        WorkflowVerifierRegistration(
+            subject="reviewer_agent",
+            build_agent="not callable",
+            build_decision_engine=lambda: None,
+        )
+
+
+def test_workflow_verifier_registration_rejects_non_callable_build_decision_engine():
+    with pytest.raises(TypeError, match="build_decision_engine must be"):
+        WorkflowVerifierRegistration(
+            subject="reviewer_agent",
+            build_agent=lambda: None,
+            build_decision_engine="not callable",
+        )
+
+
+def test_kernel_rejects_a_non_registration_independent_verifier():
+    with pytest.raises(TypeError, match="WorkflowVerifierRegistration"):
+        Kernel(
+            orchestration_engine=SequentialOrchestrationEngine(),
+            independent_verifier="not a registration",
+        )
+
+
+# ---------------------------------------------------------------------
+# INDEPENDENT VERIFICATION (Build Phase 12: PolicyEngine.
+# evaluate_workflow_trigger() wired into a real Kernel call site -- see
+# Kernel._trigger_independent_verification's own docstring)
+# ---------------------------------------------------------------------
+
+def test_independent_verification_is_none_when_no_verifier_is_configured():
+    """
+    The default, unconfigured case: even though writer_agent's
+    write_report call here genuinely matches the one declared
+    transition, an unconfigured Kernel (independent_verifier=None, the
+    default) must never trigger anything -- see Kernel.__init__'s own
+    docstring for why this purely-additive capability must be
+    completely inert unless a caller explicitly opts in.
+    """
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        kernel = Kernel(orchestration_engine=SequentialOrchestrationEngine())
+
+        kernel.register_agent(
+            AgentRegistration(
+                subject="writer_agent",
+                description="Publishes a report, then completes.",
+                can_handle=lambda normalized: True,
+                build_agent=lambda: _build_write_report_tool_agent(tmp_dir),
+                build_decision_engine=lambda: _WriteReportThenCompleteEngine(),
+            )
+        )
+
+        result = kernel.run("Draft and publish a report.")
+
+        assert result.status == "COMPLETED"
+        assert result.independent_verification is None
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_independent_verification_triggers_reviewer_agent_after_a_successful_write_report():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        verifier_build_count = {"n": 0}
+
+        def build_verifier_agent():
+            verifier_build_count["n"] += 1
+            return _build_zero_tool_agent(tmp_dir, subject="reviewer_agent")
+
+        kernel = Kernel(
+            orchestration_engine=SequentialOrchestrationEngine(),
+            independent_verifier=WorkflowVerifierRegistration(
+                subject="reviewer_agent",
+                build_agent=build_verifier_agent,
+                build_decision_engine=lambda: _ImmediateCompleteEngine(),
+            ),
+        )
+
+        kernel.register_agent(
+            AgentRegistration(
+                subject="writer_agent",
+                description="Publishes a report, then completes.",
+                can_handle=lambda normalized: True,
+                build_agent=lambda: _build_write_report_tool_agent(tmp_dir),
+                build_decision_engine=lambda: _WriteReportThenCompleteEngine(
+                    filename="report.md"
+                ),
+            )
+        )
+
+        result = kernel.run("Draft and publish a report.")
+
+        # The primary task's own outcome is completely unaffected by
+        # the secondary verification step.
+        assert result.status == "COMPLETED"
+        assert result.subject == "writer_agent"
+
+        assert result.independent_verification is not None
+        assert result.independent_verification.status == "COMPLETED"
+        assert verifier_build_count["n"] == 1
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_independent_verification_not_triggered_for_an_unrelated_completed_subject():
+    """
+    A configured independent_verifier for "reviewer_agent" must not
+    fire just because *some* agent completed a tool call -- only the
+    one declared transition (writer_agent's write_report SUCCESS)
+    triggers it. Here the primary agent is registered under subject
+    "research_agent" using the same write_report-shaped tool, which
+    PolicyEngine.evaluate_workflow_trigger() does not recognize as a
+    trigger for that subject.
+    """
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        verifier_build_count = {"n": 0}
+
+        def build_verifier_agent():
+            verifier_build_count["n"] += 1
+            return _build_zero_tool_agent(tmp_dir, subject="reviewer_agent")
+
+        kernel = Kernel(
+            orchestration_engine=SequentialOrchestrationEngine(),
+            independent_verifier=WorkflowVerifierRegistration(
+                subject="reviewer_agent",
+                build_agent=build_verifier_agent,
+                build_decision_engine=lambda: _ImmediateCompleteEngine(),
+            ),
+        )
+
+        kernel.register_agent(
+            AgentRegistration(
+                subject="research_agent",
+                description="Publishes a report, then completes.",
+                can_handle=lambda normalized: True,
+                build_agent=lambda: _build_write_report_tool_agent(
+                    tmp_dir, subject="research_agent"
+                ),
+                build_decision_engine=lambda: _WriteReportThenCompleteEngine(),
+            )
+        )
+
+        result = kernel.run("Draft and publish a report.")
+
+        assert result.status == "COMPLETED"
+        assert result.independent_verification is None
+        assert verifier_build_count["n"] == 0
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_independent_verification_returns_none_when_no_tool_was_invoked():
+    kernel = Kernel(orchestration_engine=SequentialOrchestrationEngine())
+
+    loop_result = AgentLoopResult(
+        status="COMPLETED",
+        steps=1,
+        last_result=None,
+        reason="Done.",
+        context=AgentContext(task="x"),
+    )
+
+    assert (
+        kernel._trigger_independent_verification(
+            completed_subject="writer_agent",
+            loop_result=loop_result,
+            max_steps=10,
+        )
+        is None
+    )
+
+
+def test_independent_verification_degrades_to_none_when_artifact_has_no_usable_path():
+    """
+    Mirrors test_evaluate_policy_degrades_to_none_when_security_
+    decision_is_incomplete's own reasoning: a caller-supplied
+    ToolRuntime/AgentCore substitute outside this project's own
+    ToolGateway may report a SUCCESS write_report result with an
+    artifact shape that doesn't carry a usable "path" -- this must
+    degrade to None, never raise.
+    """
+    kernel = Kernel(
+        orchestration_engine=SequentialOrchestrationEngine(),
+        independent_verifier=WorkflowVerifierRegistration(
+            subject="reviewer_agent",
+            build_agent=lambda: (_ for _ in ()).throw(
+                AssertionError("must not be called")
+            ),
+            build_decision_engine=lambda: (_ for _ in ()).throw(
+                AssertionError("must not be called")
+            ),
+        ),
+    )
+
+    incomplete_tool_result = SimpleNamespace(
+        status="SUCCESS",
+        subject="writer_agent",
+        tool_id="write_report",
+        action="write",
+        artifacts=({"no_path_here": True},),
+    )
+
+    loop_result = AgentLoopResult(
+        status="COMPLETED",
+        steps=1,
+        last_result=incomplete_tool_result,
+        reason="Done.",
+        context=AgentContext(task="x"),
+    )
+
+    assert (
+        kernel._trigger_independent_verification(
+            completed_subject="writer_agent",
+            loop_result=loop_result,
+            max_steps=10,
+        )
+        is None
+    )
+
+
+def test_independent_verification_genuinely_delegates_to_the_injected_policy_engine():
+    """
+    Proves _trigger_independent_verification() actually calls out to
+    self.policy_engine.evaluate_workflow_trigger() rather than
+    hardcoding "write_report"/"SUCCESS" itself -- the same
+    genuine-delegation proof already applied to _should_recover and
+    _evaluate_policy (see those tests above): an injected PolicyEngine
+    subclass whose evaluate_workflow_trigger() always names
+    "reviewer_agent" as the next subject, for an otherwise-impossible
+    (tool_id/status) combination, is exactly what the Kernel obeys.
+    """
+
+    class _AlwaysTriggerReviewerPolicyEngine(PolicyEngine):
+        def evaluate_workflow_trigger(self, **kwargs):
+            return WorkflowTriggerEvaluation(
+                completed_subject=kwargs["completed_subject"],
+                tool_id=kwargs["tool_id"],
+                tool_status=kwargs["tool_status"],
+                should_trigger=True,
+                next_subject="reviewer_agent",
+            )
+
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        verifier_build_count = {"n": 0}
+
+        def build_verifier_agent():
+            verifier_build_count["n"] += 1
+            return _build_zero_tool_agent(tmp_dir, subject="reviewer_agent")
+
+        kernel = Kernel(
+            orchestration_engine=SequentialOrchestrationEngine(),
+            policy_engine=_AlwaysTriggerReviewerPolicyEngine(),
+            independent_verifier=WorkflowVerifierRegistration(
+                subject="reviewer_agent",
+                build_agent=build_verifier_agent,
+                build_decision_engine=lambda: _ImmediateCompleteEngine(),
+            ),
+        )
+
+        incomplete_tool_result = SimpleNamespace(
+            status="ANYTHING",
+            subject="some_agent",
+            tool_id="some_tool",
+            action="execute",
+            artifacts=({"path": "whatever.md"},),
+        )
+
+        loop_result = AgentLoopResult(
+            status="COMPLETED",
+            steps=1,
+            last_result=incomplete_tool_result,
+            reason="Done.",
+            context=AgentContext(task="x"),
+        )
+
+        independent_verification = kernel._trigger_independent_verification(
+            completed_subject="some_agent",
+            loop_result=loop_result,
+            max_steps=10,
+        )
+
+        assert independent_verification is not None
+        assert independent_verification.status == "COMPLETED"
+        assert verifier_build_count["n"] == 1
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)

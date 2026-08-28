@@ -118,7 +118,17 @@ from core.policies.policy_engine import (
 #                           recovery_attempts reports exactly how many
 #                           retries actually happened, so recovery is
 #                           inspectable, never silent.
-#   VERIFY                  real (_verify) -- see KernelVerification
+#   VERIFY                  real (_verify) -- see KernelVerification.
+#                           Build Phase 12 added a second, purely
+#                           additive verification path alongside it:
+#                           _trigger_independent_verification, which
+#                           can run a real second agent (reviewer_agent,
+#                           via an injected WorkflowVerifierRegistration)
+#                           for real, independent, content-level
+#                           verification of one specific completed
+#                           action -- see that method's own docstring
+#                           and KernelResult.independent_verification
+#                           below for exactly what this covers.
 #   HUMAN APPROVAL           real: an AgentLoopResult of
 #   IF REQUIRED             APPROVAL_REQUIRED is surfaced as
 #                           KernelResult.status == "AWAITING_APPROVAL",
@@ -206,10 +216,19 @@ class KernelVerification:
     COMPLETE right after a tool call failed or was denied, which
     would otherwise report success on top of a real failure.
 
-    This is deliberately narrow. A dedicated verification subsystem
-    (independently re-checking claims, not just consistency-checking
-    the agent's own last result) is future work; see this module's
-    own docstring.
+    This is deliberately narrow: a fast, generic, always-on
+    consistency check, not a content-level re-verification of any
+    claim. Build Phase 11 built exactly the "dedicated verification
+    subsystem (independently re-checking claims, not just consistency-
+    checking the agent's own last result)" this docstring used to name
+    as future work -- reviewer_agent (core/agents/reviewer_agent.py) --
+    and Build Phase 12 gave the Kernel a real, optional, purely
+    additive way to actually run it after a specific completed action
+    (see Kernel._trigger_independent_verification and
+    KernelResult.independent_verification below). This method itself
+    is unchanged by either phase and still means exactly what it always
+    has: it never reads reviewer_agent's own result, and reviewer_agent
+    never gates or changes what this method reports.
     """
 
     passed: bool
@@ -249,6 +268,23 @@ class KernelResult:
     invoked at all, or when the identifying/security data needed to
     answer those six questions was itself incomplete -- this field is
     purely inspectable diagnostic data; it never changes `status`.
+
+    `independent_verification` (Build Phase 12) is the AgentLoopResult
+    of a real second agent (reviewer_agent) the Kernel triggered after
+    this run's own completed action, when POLICY_SPEC.md's Workflow
+    Constraints (PolicyEngine.evaluate_workflow_trigger) named one and
+    a WorkflowVerifierRegistration for that exact subject was
+    configured on this Kernel -- see Kernel._trigger_independent_
+    verification's own docstring for exactly when this runs. `None`
+    whenever no transition was triggered, or none is configured. Like
+    `policy_evaluation`, this is purely inspectable diagnostic data: it
+    never changes `status`, and a reviewer_agent finding of
+    unsupported claims never retroactively fails the run it's
+    reviewing -- second-guessing the primary agent's own already-
+    reported outcome based on a secondary, advisory agent's opinion
+    would itself violate this project's standing constraint that the
+    system must never become so strict it refuses to execute/accept
+    something.
     """
 
     status: str
@@ -258,6 +294,7 @@ class KernelResult:
     reason: str | None
     recovery_attempts: int = 0
     policy_evaluation: ExternalActionEvaluation | None = None
+    independent_verification: AgentLoopResult | None = None
 
 
 @dataclass(frozen=True)
@@ -309,6 +346,49 @@ class AgentRegistration:
             )
 
 
+@dataclass(frozen=True)
+class WorkflowVerifierRegistration:
+    """
+    Registers exactly one agent with the Kernel as its Workflow
+    Constraints (Build Phase 12) independent-verification target --
+    deliberately a separate, lighter dataclass from AgentRegistration,
+    not a reuse of it: this agent is never selected via CLASSIFY/
+    _select_agent (it has no `can_handle`/`description` -- it is only
+    ever triggered by Kernel._trigger_independent_verification, per a
+    real PolicyEngine.evaluate_workflow_trigger() answer, after another
+    agent's own primary run already completed).
+
+    `build_agent`/`build_decision_engine` are factories, not instances,
+    for the exact same reason AgentRegistration's own fields are (see
+    its own docstring): a fresh agent/decision engine is built for
+    every trigger, never reused across runs.
+    """
+
+    subject: str
+    build_agent: Callable[[], AgentCore]
+    build_decision_engine: Callable[[], AgentDecisionEngine]
+
+    def __post_init__(self) -> None:
+
+        if not isinstance(self.subject, str) or not self.subject.strip():
+            raise ValueError(
+                "WorkflowVerifierRegistration.subject must be a "
+                "non-empty string."
+            )
+
+        if not callable(self.build_agent):
+            raise TypeError(
+                "WorkflowVerifierRegistration.build_agent must be "
+                "callable."
+            )
+
+        if not callable(self.build_decision_engine):
+            raise TypeError(
+                "WorkflowVerifierRegistration.build_decision_engine "
+                "must be callable."
+            )
+
+
 class Kernel:
     """
     Real (v1) implementation of the Brain Kernel described in
@@ -333,12 +413,31 @@ class Kernel:
     `policy_engine` is the real (v1) core/policies/POLICY_SPEC.md
     implementation (core.policies.policy_engine.PolicyEngine) this
     Kernel consults for RECOVER IF NEEDED's authorization decision
-    (see _should_recover) and, as of Build Phase 7, for answering
-    POLICY_SPEC.md's External Actions six questions about the last
-    tool actually invoked (see _evaluate_policy and
-    KernelResult.policy_evaluation). Defaults to a fresh
+    (see _should_recover), for answering POLICY_SPEC.md's External
+    Actions six questions about the last tool actually invoked (see
+    _evaluate_policy and KernelResult.policy_evaluation, real since
+    Build Phase 7), and, as of Build Phase 12, for Workflow Constraints
+    -- whether a completed action should trigger a second, specific
+    agent next (see _trigger_independent_verification and
+    KernelResult.independent_verification). Defaults to a fresh
     PolicyEngine(); injected mainly for tests that want to substitute
     or inspect it.
+
+    `independent_verifier` (Build Phase 12) is an optional
+    WorkflowVerifierRegistration naming exactly one agent this Kernel
+    may trigger for real, independent, content-level verification of a
+    specific completed action (currently: reviewer_agent, after a
+    SUCCESSful writer_agent write_report call -- see
+    core/policies/policy_engine.py's own docstring, WORKFLOW
+    CONSTRAINTS, for the exact declared transition). Defaults to
+    `None`, in which case _trigger_independent_verification always
+    returns `None` and KernelResult.independent_verification is always
+    `None` -- this is a purely opt-in, additive capability: an
+    unconfigured Kernel behaves exactly as it did before Build Phase
+    12, and this project's build_default_kernel() (core/kernel/
+    default_kernel.py) only configures it when a caller explicitly
+    asks for it, so no existing caller's behavior, cost, or test counts
+    change unless they opt in.
     """
 
     def __init__(
@@ -347,6 +446,7 @@ class Kernel:
         orchestration_engine: OrchestrationEngine | None = None,
         max_recovery_attempts: int = 1,
         policy_engine: PolicyEngine | None = None,
+        independent_verifier: WorkflowVerifierRegistration | None = None,
     ) -> None:
 
         if not isinstance(max_recovery_attempts, int):
@@ -372,6 +472,16 @@ class Kernel:
             if policy_engine is not None
             else PolicyEngine()
         )
+
+        if independent_verifier is not None and not isinstance(
+            independent_verifier, WorkflowVerifierRegistration
+        ):
+            raise TypeError(
+                "independent_verifier must be a "
+                "WorkflowVerifierRegistration or None."
+            )
+
+        self.independent_verifier = independent_verifier
 
     def register_agent(
         self,
@@ -454,6 +564,12 @@ class Kernel:
 
         policy_evaluation = self._evaluate_policy(loop_result)
 
+        independent_verification = self._trigger_independent_verification(
+            completed_subject=registration.subject,
+            loop_result=loop_result,
+            max_steps=max_steps,
+        )
+
         self._learn(loop_result, verification)
 
         status = self._final_status(loop_result, verification)
@@ -466,6 +582,7 @@ class Kernel:
             reason=loop_result.reason,
             recovery_attempts=recovery_attempts,
             policy_evaluation=policy_evaluation,
+            independent_verification=independent_verification,
         )
 
     def _execute_once(
@@ -762,6 +879,127 @@ class Kernel:
             )
         except ValueError:
             return None
+
+    def _trigger_independent_verification(
+        self,
+        *,
+        completed_subject: str,
+        loop_result: AgentLoopResult,
+        max_steps: int,
+    ) -> AgentLoopResult | None:
+        """
+        POLICY_SPEC.md's Workflow Constraints (Build Phase 12): after
+        `completed_subject`'s run just completed, should a second,
+        specific agent be triggered now for real, independent,
+        content-level verification? Real, but deliberately narrow --
+        see core/policies/policy_engine.py's own docstring (WORKFLOW
+        CONSTRAINTS) for the one declared transition this currently
+        recognizes.
+
+        Returns `None` in every one of these cases, never raises for
+        any of them (the same "degrade rather than fail an otherwise-
+        real Kernel result over an optional, additive step" tolerance
+        _evaluate_policy already established -- see its own docstring):
+
+          - no tool was ever invoked during `completed_subject`'s run
+            (nothing for PolicyEngine.evaluate_workflow_trigger() to
+            answer about)
+          - PolicyEngine.evaluate_workflow_trigger() names no
+            transition for this exact (subject, tool_id, tool_status)
+          - this Kernel has no `independent_verifier` configured at all
+            (the default -- see Kernel.__init__'s own docstring for why
+            an unconfigured Kernel must never fail or behave
+            differently here)
+          - `independent_verifier` is configured for a *different*
+            subject than the one the policy actually named (defensive:
+            never trigger an unrelated agent just because some
+            transition fired)
+          - the completed action's own result carries no usable
+            artifact path to review (e.g. a caller-supplied
+            ToolRuntime/AgentCore substitute outside this project's own
+            ToolGateway, whose result shape does not match
+            write_report's real `{"path": ..., "size_bytes": ...}`
+            artifact -- the same duck-typed tolerance _verify/
+            _evaluate_policy already apply to `last_result`)
+
+        When a transition IS triggered, this builds a fresh verifier
+        agent + decision engine from `self.independent_verifier`'s own
+        factories (never reused across runs, same reasoning as
+        AgentRegistration's own factories), starts it on a real task
+        naming the exact artifact path the primary agent just
+        published (`f"Review {path}."`), and runs it to a terminal
+        result through the SAME OrchestrationEngine this Kernel already
+        uses for its primary task -- reviewer_agent's own tools are all
+        LOW-risk, read-only, and never require approval (see
+        core/agents/REVIEWER_AGENT.md), so this can never itself pause
+        on a human-approval gate the caller wasn't already expecting.
+        `max_steps` reuses the same budget the primary task was given,
+        for the same reason PLAN reuses it for RECOVER IF NEEDED
+        retries: one consistent execution budget per Kernel.run() call,
+        not a second free parameter to reason about.
+
+        A caller-supplied `build_agent()` that does not return a real
+        AgentCore raises TypeError, exactly like Kernel._plan() already
+        does for the primary agent -- that is a genuine build-time
+        misconfiguration bug in the registration itself, not incomplete
+        runtime data, so it is deliberately NOT caught and degraded to
+        None the way the cases above are.
+        """
+
+        last_result = loop_result.last_result
+
+        if last_result is None:
+            return None
+
+        evaluation = self.policy_engine.evaluate_workflow_trigger(
+            completed_subject=completed_subject,
+            tool_id=getattr(last_result, "tool_id", None),
+            tool_status=getattr(last_result, "status", None),
+        )
+
+        if not evaluation.should_trigger:
+            return None
+
+        if self.independent_verifier is None:
+            return None
+
+        if evaluation.next_subject != self.independent_verifier.subject:
+            return None
+
+        artifacts = getattr(last_result, "artifacts", None) or ()
+
+        if not artifacts:
+            return None
+
+        first_artifact = artifacts[0]
+
+        if isinstance(first_artifact, dict):
+            path = first_artifact.get("path")
+        else:
+            path = getattr(first_artifact, "path", None)
+
+        if not isinstance(path, str) or not path.strip():
+            return None
+
+        verifier_agent = self.independent_verifier.build_agent()
+
+        if not isinstance(verifier_agent, AgentCore):
+            raise TypeError(
+                "WorkflowVerifierRegistration.build_agent() must "
+                "return an AgentCore."
+            )
+
+        verifier_decision_engine = (
+            self.independent_verifier.build_decision_engine()
+        )
+
+        verifier_agent.start_task(f"Review {path}.")
+
+        return self.orchestration_engine.run(
+            agent=verifier_agent,
+            decision_engine=verifier_decision_engine,
+            max_steps=max_steps,
+        )
 
     def _learn(
         self,
