@@ -41,27 +41,35 @@ from core.security.engine.security_decision import (
 #                           re-derive any of them). Deliberately a pure
 #                           function of caller-supplied inputs rather
 #                           than something that reaches into a
-#                           ToolExecutionResult/AgentLoopResult itself:
-#                           neither SecurityDecision nor
-#                           ToolExecutionResult currently preserves
-#                           which tool_id/resource/action/scope
-#                           produced them (confirmed by reading both
-#                           dataclasses directly, not assumed -- see
-#                           core/tools/engine/tool_gateway.py and
-#                           core/security/engine/security_decision.py),
-#                           so there is nothing for the Kernel to look
-#                           up on its own yet. This method is real and
-#                           fully tested today; wiring it into a live
-#                           Kernel call site is future work gated on
-#                           that specific, named gap, not on anything
-#                           in this module. (Separately: POLICY_SPEC.md
-#                           itself says "Policies must remain separate
-#                           from agents, tools, memory, and
-#                           orchestration" and that enforcement is the
-#                           orchestration layer's job -- so this was
-#                           never a candidate to wire into
-#                           core/tools/engine/tool_gateway.py directly,
-#                           only into Kernel/orchestration-level code.)
+#                           ToolExecutionResult/AgentLoopResult itself
+#                           -- as of Build Phase 6, neither
+#                           SecurityDecision nor ToolExecutionResult
+#                           preserved which tool_id/action produced
+#                           them (confirmed by reading both dataclasses
+#                           directly, not assumed), so there was
+#                           nothing for a caller to look up on its own.
+#                           Build Phase 7 closed that specific,
+#                           named gap at its source -- ToolExecutionResult
+#                           now carries `.subject`/`.tool_id`/`.action`
+#                           (see core/tools/engine/tool_gateway.py) --
+#                           and wired this method into a real Kernel
+#                           call site: Kernel._evaluate_policy calls it
+#                           for the last tool actually invoked during a
+#                           run, surfaced as
+#                           KernelResult.policy_evaluation (see
+#                           core/kernel/kernel.py). This method itself
+#                           did not need to change for that -- it was
+#                           real and fully tested before Build Phase 7;
+#                           only the data available to callers changed.
+#                           (Separately: POLICY_SPEC.md itself says
+#                           "Policies must remain separate from agents,
+#                           tools, memory, and orchestration" and that
+#                           enforcement is the orchestration layer's
+#                           job -- so this was never a candidate to
+#                           wire into core/tools/engine/tool_gateway.py
+#                           directly, only into Kernel/orchestration-
+#                           level code, which is exactly where Build
+#                           Phase 7 wired it.)
 #
 #   FAILURE POLICY           real for the one step that was a bare,
 #                           unlabeled implementation detail before this

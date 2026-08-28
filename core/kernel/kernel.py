@@ -24,6 +24,7 @@ from core.orchestration.orchestration_engine import (
 )
 
 from core.policies.policy_engine import (
+    ExternalActionEvaluation,
     PolicyEngine,
 )
 
@@ -129,7 +130,32 @@ from core.policies.policy_engine import (
 #                           Build Phase 3) -- the Kernel must not
 #                           "replace the memory layer" (Sec.3)
 #   EVALUATE                real (KernelResult carries status +
-#                           verification + the full AgentLoopResult)
+#                           verification + the full AgentLoopResult),
+#                           and, as of Build Phase 7, also carries a
+#                           real answer to POLICY_SPEC.md's External
+#                           Actions six-question checklist for the
+#                           last tool actually invoked, when one was
+#                           (KernelResult.policy_evaluation; see
+#                           _evaluate_policy). This was previously a
+#                           gap Build Phase 6 named and deliberately
+#                           left open -- neither SecurityDecision nor
+#                           ToolExecutionResult preserved which
+#                           tool_id/action produced them, so there was
+#                           nothing for the Kernel to look up. Build
+#                           Phase 7 closed that gap at its source (see
+#                           ToolExecutionResult's own docstring in
+#                           core/tools/engine/tool_gateway.py), so
+#                           this is now a real, inspectable per-run
+#                           answer -- not a re-derivation of risk or
+#                           approval (the Security Layer already
+#                           decided those; this only asserts a
+#                           complete answer exists) and not a gate on
+#                           execution (the Tool Gateway already
+#                           enforced authorization synchronously,
+#                           before this Kernel ever sees a result --
+#                           see this method's own docstring for why a
+#                           missing/malformed answer degrades to None
+#                           instead of failing the whole run).
 #   LEARN                   explicit no-op: no lesson-recording
 #                           subsystem exists yet
 #   FINAL RESULT            real (KernelResult)
@@ -216,6 +242,13 @@ class KernelResult:
                               EXECUTION_ERROR) -- the Kernel does not
                               invent new vocabulary for cases the
                               execution loop already reports clearly.
+
+    `policy_evaluation` answers POLICY_SPEC.md's External Actions
+    six-question checklist for the last tool actually invoked during
+    this run (see Kernel._evaluate_policy). None when no tool was
+    invoked at all, or when the identifying/security data needed to
+    answer those six questions was itself incomplete -- this field is
+    purely inspectable diagnostic data; it never changes `status`.
     """
 
     status: str
@@ -224,6 +257,7 @@ class KernelResult:
     verification: KernelVerification | None
     reason: str | None
     recovery_attempts: int = 0
+    policy_evaluation: ExternalActionEvaluation | None = None
 
 
 @dataclass(frozen=True)
@@ -299,8 +333,12 @@ class Kernel:
     `policy_engine` is the real (v1) core/policies/POLICY_SPEC.md
     implementation (core.policies.policy_engine.PolicyEngine) this
     Kernel consults for RECOVER IF NEEDED's authorization decision
-    (see _should_recover). Defaults to a fresh PolicyEngine(); injected
-    mainly for tests that want to substitute or inspect it.
+    (see _should_recover) and, as of Build Phase 7, for answering
+    POLICY_SPEC.md's External Actions six questions about the last
+    tool actually invoked (see _evaluate_policy and
+    KernelResult.policy_evaluation). Defaults to a fresh
+    PolicyEngine(); injected mainly for tests that want to substitute
+    or inspect it.
     """
 
     def __init__(
@@ -414,6 +452,8 @@ class Kernel:
 
         verification = self._verify(loop_result)
 
+        policy_evaluation = self._evaluate_policy(loop_result)
+
         self._learn(loop_result, verification)
 
         status = self._final_status(loop_result, verification)
@@ -425,6 +465,7 @@ class Kernel:
             verification=verification,
             reason=loop_result.reason,
             recovery_attempts=recovery_attempts,
+            policy_evaluation=policy_evaluation,
         )
 
     def _execute_once(
@@ -650,6 +691,77 @@ class Kernel:
                 f"not succeed (status={getattr(last_result, 'status', None)!r})."
             ),
         )
+
+    def _evaluate_policy(
+        self,
+        loop_result: AgentLoopResult,
+    ) -> ExternalActionEvaluation | None:
+        """
+        Answers POLICY_SPEC.md's "External Actions" six questions for
+        the external action actually performed during this run, when
+        one was. Real: uses the identifying data ToolExecutionResult
+        now carries (`.subject`, `.tool_id`, `.action`, added in Build
+        Phase 7 -- see its own docstring in
+        core/tools/engine/tool_gateway.py) together with the real
+        SecurityDecision the Tool Gateway already computed
+        (`.security_decision`). This never re-derives risk or
+        approval itself -- see PolicyEngine.evaluate_external_action()'s
+        own docstring -- it only packages an already-final answer into
+        one inspectable record.
+
+        This closes the gap Build Phase 6 named and deliberately left
+        open (see core/policies/policy_engine.py's module docstring):
+        before Build Phase 7, neither SecurityDecision nor
+        ToolExecutionResult preserved which tool_id/action produced
+        them, so there was nothing here for the Kernel to look up.
+
+        This is deliberately a post-hoc, inspectable record, not a
+        pre-execution gate: by the time the Kernel ever sees
+        `loop_result`, the Tool Gateway has already synchronously
+        authorized (or denied) every tool call the agent made during
+        the loop -- POLICY_SPEC.md's own text ("Policies must remain
+        separate from agents, tools, memory, and orchestration") rules
+        out the Kernel/Policy Layer reaching into the loop to gate
+        calls one at a time, and Kernel v1's architecture has no
+        per-step hook of its own to do that from outside the loop
+        anyway (see this module's own docstring, EXECUTE).
+
+        Returns None when no tool was ever invoked (`last_result` is
+        None -- e.g. the agent completed or failed without calling a
+        tool): there is no external action here to answer these
+        questions about.
+
+        Also returns None -- rather than letting this propagate out of
+        Kernel.run() -- when the identifying/security data itself is
+        incomplete (PolicyEngine.evaluate_external_action() raises
+        ValueError for that). This is a real, not just theoretical,
+        possibility: `last_result` is only required to be duck-typed
+        (see _verify's own precedent), so a caller-supplied
+        AgentCore/ToolRuntime substitute outside this project's own
+        ToolGateway may not carry a complete SecurityDecision. Per
+        this project's standing constraint that the system must never
+        become so strict it refuses to execute anything, an incomplete
+        policy answer degrades this one inspectable field to None
+        rather than failing an otherwise-real Kernel result over data
+        that was never required to produce it.
+        """
+
+        last_result = loop_result.last_result
+
+        if last_result is None:
+            return None
+
+        try:
+            return self.policy_engine.evaluate_external_action(
+                action=getattr(last_result, "action", None),
+                subject=getattr(last_result, "subject", None),
+                tool_id=getattr(last_result, "tool_id", None),
+                security_decision=getattr(
+                    last_result, "security_decision", None
+                ),
+            )
+        except ValueError:
+            return None
 
     def _learn(
         self,

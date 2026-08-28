@@ -398,3 +398,146 @@ def test_high_risk_requires_approval():
         assert execution_state["called"] is False
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------
+# ToolExecutionResult.subject/tool_id/action (Build Phase 7: added so
+# a Kernel-level consumer of AgentLoopResult.last_result can answer
+# PolicyEngine.evaluate_external_action()'s six questions without any
+# caller having to separately track which tool_id/action produced a
+# given result -- see ToolExecutionResult's own docstring in
+# core/tools/engine/tool_gateway.py).
+# ---------------------------------------------------------------------
+
+def test_successful_execution_reports_subject_tool_id_and_action():
+    gateway = build_gateway(
+        executor=lambda query: "SUCCESS: " + query
+    )
+
+    result = gateway.execute(
+        subject="research_agent",
+        tool_id="web_search",
+        tool_kwargs={
+            "query": "AI agents",
+        },
+    )
+
+    assert result.subject == "research_agent"
+    assert result.tool_id == "web_search"
+    assert result.action == "search"
+
+
+def test_unknown_tool_reports_subject_and_tool_id_with_execute_action():
+    registry = ToolRegistry()
+
+    security = SecurityDecisionPoint(PERMISSIONS_FILE)
+
+    gateway = ToolGateway(
+        security=security,
+        registry=registry,
+    )
+
+    result = gateway.execute(
+        subject="research_agent",
+        tool_id="secret_tool",
+        tool_kwargs={},
+    )
+
+    assert result.status == "DENIED"
+    assert result.subject == "research_agent"
+    assert result.tool_id == "secret_tool"
+    # No ToolDefinition was ever resolved -- "execute" is the
+    # documented default for exactly this case.
+    assert result.action == "execute"
+
+
+def test_denied_execution_reports_subject_tool_id_and_action():
+    gateway = build_gateway(
+        executor=lambda query: "SHOULD NOT EXECUTE"
+    )
+
+    result = gateway.execute(
+        subject="unauthorized_agent",
+        tool_id="web_search",
+        tool_kwargs={
+            "query": "AI agents",
+        },
+    )
+
+    assert result.status == "DENIED"
+    assert result.subject == "unauthorized_agent"
+    assert result.tool_id == "web_search"
+    assert result.action == "search"
+
+
+def test_approval_required_execution_reports_subject_tool_id_and_action():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        registry = ToolRegistry()
+
+        registry.register(
+            ToolDefinition(
+                id="shell",
+                name="Shell",
+                purpose="Execute a shell command.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                        }
+                    },
+                    "required": ["command"],
+                    "additionalProperties": False,
+                },
+                output_schema={
+                    "type": "string",
+                },
+                permissions=(
+                    "research_agent:shell:execute:workspace",
+                ),
+                resource="shell",
+                action="execute",
+                scope="workspace",
+                risk_level="HIGH",
+                error_handling={
+                    "retryable": False,
+                    "on_failure": (
+                        "Do not retry a shell command automatically; "
+                        "surface the failure for human review."
+                    ),
+                },
+            )
+        )
+
+        policy_path = _write_isolated_shell_policy(tmp_dir)
+
+        security = SecurityDecisionPoint(
+            policy_path=str(policy_path),
+            audit_log_path=str(tmp_dir / "audit.jsonl"),
+        )
+
+        gateway = ToolGateway(
+            security=security,
+            registry=registry,
+        )
+
+        gateway.register_executor(
+            tool_id="shell",
+            executor=lambda command: "SHELL EXECUTED",
+        )
+
+        result = gateway.execute(
+            subject="research_agent",
+            tool_id="shell",
+            tool_kwargs={
+                "command": "echo test",
+            },
+        )
+
+        assert result.status == "APPROVAL_REQUIRED"
+        assert result.subject == "research_agent"
+        assert result.tool_id == "shell"
+        assert result.action == "execute"
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)

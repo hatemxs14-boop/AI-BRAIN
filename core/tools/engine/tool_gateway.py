@@ -29,6 +29,21 @@ from core.tools.validation.output_validator import (
 class ToolExecutionResult:
     """
     Standard result returned by the Tool Gateway.
+
+    `subject`/`tool_id`/`action` identify exactly which agent requested
+    which tool action produced this result. Added specifically to
+    close a gap Build Phase 6 named but deliberately left open (see
+    core/policies/policy_engine.py's own module docstring): neither
+    this dataclass nor SecurityDecision previously preserved which
+    tool_id/action produced them, so a Kernel-level consumer of
+    AgentLoopResult.last_result had nothing to pass PolicyEngine.
+    evaluate_external_action() for its `action`/`subject`/`tool_id`
+    parameters -- see core/kernel/kernel.py's `_evaluate_policy`.
+    `action` defaults to "execute" only for the one path where no
+    ToolDefinition was ever resolved (an unknown tool_id) -- the same
+    default already used for that case's own SecurityDecision in
+    `_unknown_tool_security_decision` below, for the same reason:
+    there is no real registered action to report.
     """
 
     status: str
@@ -36,6 +51,9 @@ class ToolExecutionResult:
     next_actions: tuple[str, ...]
     artifacts: tuple[Any, ...]
     security_decision: SecurityDecision
+    subject: str
+    tool_id: str
+    action: str = "execute"
 
 
 class ToolGateway:
@@ -184,6 +202,12 @@ class ToolGateway:
                     subject=subject,
                     tool_id=tool_id,
                 ),
+                subject=subject,
+                tool_id=tool_id,
+                # No ToolDefinition was ever resolved for this tool_id
+                # -- there is no real registered action to report, so
+                # this uses the same "execute" default as
+                # _unknown_tool_security_decision below.
             )
 
         # ---------------------------------------------------------
@@ -209,6 +233,9 @@ class ToolGateway:
                     subject=subject,
                     tool=tool,
                 ),
+                subject=subject,
+                tool_id=tool_id,
+                action=tool.action,
             )
 
         # ---------------------------------------------------------
@@ -232,6 +259,9 @@ class ToolGateway:
                     subject=subject,
                     tool=tool,
                 ),
+                subject=subject,
+                tool_id=tool_id,
+                action=tool.action,
             )
 
         # ---------------------------------------------------------
@@ -259,6 +289,9 @@ class ToolGateway:
                     subject=subject,
                     tool=tool,
                 ),
+                subject=subject,
+                tool_id=tool_id,
+                action=tool.action,
             )
 
         # ---------------------------------------------------------
@@ -330,6 +363,9 @@ class ToolGateway:
                     f"assessed_risk={assessed_risk}",
                 ),
                 security_decision=security_decision,
+                subject=subject,
+                tool_id=tool_id,
+                action=action,
             )
 
         # ---------------------------------------------------------
@@ -346,6 +382,9 @@ class ToolGateway:
                 ),
                 artifacts=(),
                 security_decision=security_decision,
+                subject=subject,
+                tool_id=tool_id,
+                action=action,
             )
 
         # ---------------------------------------------------------
@@ -362,6 +401,9 @@ class ToolGateway:
                 ),
                 artifacts=(),
                 security_decision=security_decision,
+                subject=subject,
+                tool_id=tool_id,
+                action=action,
             )
 
         # ---------------------------------------------------------
@@ -390,6 +432,9 @@ class ToolGateway:
                 ),
                 artifacts=(),
                 security_decision=security_decision,
+                subject=subject,
+                tool_id=tool_id,
+                action=action,
             )
 
         # ---------------------------------------------------------
@@ -418,6 +463,9 @@ class ToolGateway:
                 ),
                 artifacts=(str(exc),),
                 security_decision=security_decision,
+                subject=subject,
+                tool_id=tool_id,
+                action=action,
             )
 
         # ---------------------------------------------------------
@@ -442,6 +490,9 @@ class ToolGateway:
                 ),
                 artifacts=output_validation.errors,
                 security_decision=security_decision,
+                subject=subject,
+                tool_id=tool_id,
+                action=action,
             )
 
         # ---------------------------------------------------------
@@ -454,6 +505,9 @@ class ToolGateway:
             next_actions=(),
             artifacts=(output,),
             security_decision=security_decision,
+            subject=subject,
+            tool_id=tool_id,
+            action=action,
         )
 
     @staticmethod

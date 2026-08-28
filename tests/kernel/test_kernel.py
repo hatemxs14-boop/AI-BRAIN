@@ -37,7 +37,10 @@ from core.orchestration.orchestration_engine import (
     SequentialOrchestrationEngine,
 )
 
-from core.policies.policy_engine import PolicyEngine
+from core.policies.policy_engine import (
+    ExternalActionEvaluation,
+    PolicyEngine,
+)
 
 from core.security.engine.security_decision import SecurityDecisionPoint
 
@@ -110,6 +113,117 @@ def _write_shell_policy(tmp_dir: Path) -> Path:
     policy_path = tmp_dir / "permissions.json"
     policy_path.write_text(json.dumps(policy), encoding="utf-8")
     return policy_path
+
+
+def _write_low_risk_search_policy(
+    tmp_dir: Path, subject: str = "test_agent"
+) -> Path:
+    policy = {
+        "version": "1.0",
+        "permissions": [
+            {
+                "subject": subject,
+                "resource": "web_search",
+                "action": "search",
+                "scope": "public_web",
+                "risk_level": "LOW",
+                "approval": "none",
+            }
+        ],
+        "defaults": {
+            "unknown_risk": "DENY",
+            "unknown_permission": "DENY",
+            "unknown_scope": "DENY",
+            "authorization_failure": "DENY",
+        },
+    }
+    policy_path = tmp_dir / "permissions.json"
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    return policy_path
+
+
+def _build_low_risk_tool_agent(tmp_dir: Path, subject: str = "test_agent") -> AgentCore:
+    """
+    A real, LOW-risk, auto-allowed tool (unlike _build_zero_tool_agent,
+    which has no tools at all, and _build_shell_tool_agent, whose tool
+    always requires approval) -- used specifically to exercise a real
+    SUCCESS-path ToolExecutionResult (with a real SecurityDecision)
+    through the full Kernel.run() lifecycle.
+    """
+
+    registry = ToolRegistry()
+
+    registry.register(
+        ToolDefinition(
+            id="web_search",
+            name="Web Search",
+            purpose="Search the public web.",
+            input_schema={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+            output_schema={"type": "string"},
+            permissions=(f"{subject}:web_search:search:public_web",),
+            resource="web_search",
+            action="search",
+            scope="public_web",
+            risk_level="LOW",
+            error_handling={
+                "retryable": True,
+                "max_retries": 2,
+                "on_failure": "Surface the search error to the agent.",
+            },
+        )
+    )
+
+    policy_path = _write_low_risk_search_policy(tmp_dir, subject=subject)
+
+    security = SecurityDecisionPoint(
+        policy_path=str(policy_path),
+        audit_log_path=str(tmp_dir / "audit.jsonl"),
+    )
+
+    gateway = ToolGateway(security=security, registry=registry)
+    gateway.register_executor(
+        tool_id="web_search",
+        executor=lambda query: f"RESULT: {query}",
+    )
+
+    runtime = ToolRuntime(registry=registry, gateway=gateway)
+    interface = AgentToolInterface(runtime=runtime)
+
+    identity = AgentIdentity(
+        subject=subject,
+        name="Test Agent",
+        purpose="A minimal agent used only to exercise Kernel mechanics.",
+    )
+
+    return AgentCore(identity=identity, tools=interface)
+
+
+class _SearchThenCompleteEngine(AgentDecisionEngine):
+    """Invokes web_search exactly once, then completes."""
+
+    def __init__(self):
+        self._invoked = False
+
+    def decide(self, context):
+        if not self._invoked:
+            self._invoked = True
+
+            return AgentAction(
+                action_type=AgentActionType.INVOKE_TOOL,
+                tool_id="web_search",
+                inputs={"query": "AI agents"},
+                reason="Search before completing.",
+            )
+
+        return AgentAction(
+            action_type=AgentActionType.COMPLETE,
+            reason="Search complete.",
+        )
 
 
 def _build_zero_tool_agent(tmp_dir: Path, subject: str = "test_agent") -> AgentCore:
@@ -292,6 +406,9 @@ def test_run_completes_and_verifies_when_no_tool_is_ever_invoked():
         assert result.verification is not None
         assert result.verification.passed is True
         assert result.loop_result.status == "COMPLETED"
+        # No tool was ever invoked -- there is no external action for
+        # the Policy Layer to answer the six questions about.
+        assert result.policy_evaluation is None
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -317,6 +434,15 @@ def test_run_surfaces_approval_required_as_awaiting_approval():
         assert result.loop_result.status == "APPROVAL_REQUIRED"
         # The Kernel must never have silently resolved this itself.
         assert result.loop_result.last_result.status == "APPROVAL_REQUIRED"
+        # The Policy Layer's six-question answer must reflect the real,
+        # HIGH-risk, approval-required decision the Security Layer
+        # actually made for this tool call.
+        assert result.policy_evaluation is not None
+        assert result.policy_evaluation.action == "execute"
+        assert result.policy_evaluation.subject == "test_agent"
+        assert result.policy_evaluation.tool_id == "shell"
+        assert result.policy_evaluation.risk_level == "HIGH"
+        assert result.policy_evaluation.approval_required is True
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -754,3 +880,148 @@ def test_recovery_does_not_trigger_for_a_deliberate_approval_required_outcome():
         assert engine_build_count["n"] == 1
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------
+# POLICY EVALUATION (Build Phase 7: PolicyEngine.evaluate_external_
+# action() wired into a real Kernel call site -- see Kernel.
+# _evaluate_policy's own docstring)
+# ---------------------------------------------------------------------
+
+def test_run_answers_the_policy_six_questions_for_a_successful_tool_call():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        kernel = Kernel(orchestration_engine=SequentialOrchestrationEngine())
+
+        kernel.register_agent(
+            AgentRegistration(
+                subject="test_agent",
+                description="Searches once, then completes.",
+                can_handle=lambda normalized: True,
+                build_agent=lambda: _build_low_risk_tool_agent(tmp_dir),
+                build_decision_engine=lambda: _SearchThenCompleteEngine(),
+            )
+        )
+
+        result = kernel.run("Search for something.")
+
+        assert result.status == "COMPLETED"
+        assert result.loop_result.last_result.status == "SUCCESS"
+        assert result.policy_evaluation is not None
+        assert result.policy_evaluation.action == "search"
+        assert result.policy_evaluation.subject == "test_agent"
+        assert result.policy_evaluation.tool_id == "web_search"
+        assert result.policy_evaluation.risk_level == "LOW"
+        assert result.policy_evaluation.approval_required is False
+        assert result.policy_evaluation.verification_required is True
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_evaluate_policy_returns_none_when_no_tool_was_invoked():
+    kernel = Kernel(orchestration_engine=SequentialOrchestrationEngine())
+
+    loop_result = AgentLoopResult(
+        status="COMPLETED",
+        steps=1,
+        last_result=None,
+        reason="Done.",
+        context=AgentContext(task="x"),
+    )
+
+    assert kernel._evaluate_policy(loop_result) is None
+
+
+def test_evaluate_policy_degrades_to_none_when_security_decision_is_incomplete():
+    """
+    _evaluate_policy must never let a Kernel.run() call crash over
+    incomplete identifying/security data -- see its own docstring for
+    why (this project's standing constraint that the system must
+    never become so strict it refuses to execute anything). A
+    SimpleNamespace last_result with no real SecurityDecision (e.g. a
+    caller-supplied ToolRuntime/AgentCore substitute outside this
+    project's own ToolGateway -- see tests/agents/
+    test_agent_llm_integration.py's own MockToolRuntime, which can
+    construct exactly this shape) triggers PolicyEngine.
+    evaluate_external_action()'s ValueError, which this method must
+    catch and turn into None rather than propagate.
+    """
+
+    kernel = Kernel(orchestration_engine=SequentialOrchestrationEngine())
+
+    incomplete_tool_result = SimpleNamespace(
+        status="SUCCESS",
+        subject="test_agent",
+        tool_id="web_search",
+        action="search",
+        security_decision=None,
+    )
+
+    loop_result = AgentLoopResult(
+        status="COMPLETED",
+        steps=1,
+        last_result=incomplete_tool_result,
+        reason="Done.",
+        context=AgentContext(task="x"),
+    )
+
+    assert kernel._evaluate_policy(loop_result) is None
+
+
+def test_evaluate_policy_genuinely_delegates_to_the_injected_policy_engine():
+    """
+    Proves _evaluate_policy() actually calls out to
+    self.policy_engine.evaluate_external_action() rather than
+    answering the six questions itself -- an injected PolicyEngine
+    subclass that overrides evaluate_external_action() to return a
+    fixed, otherwise-impossible answer is exactly what the Kernel
+    surfaces, the same genuine-delegation proof already applied to
+    _should_recover (see test_should_recover_genuinely_delegates_to_
+    the_injected_policy_engine above).
+    """
+
+    class _FixedAnswerPolicyEngine(PolicyEngine):
+        def evaluate_external_action(self, **kwargs):
+            return ExternalActionEvaluation(
+                action="INJECTED",
+                subject="INJECTED",
+                tool_id="INJECTED",
+                risk_level="INJECTED",
+                approval_required=True,
+                verification_required=False,
+            )
+
+    kernel = Kernel(
+        orchestration_engine=SequentialOrchestrationEngine(),
+        policy_engine=_FixedAnswerPolicyEngine(),
+    )
+
+    real_shaped_tool_result = SimpleNamespace(
+        status="SUCCESS",
+        subject="test_agent",
+        tool_id="web_search",
+        action="search",
+        security_decision=SimpleNamespace(
+            authorization=SimpleNamespace(effective_risk="LOW"),
+            approval=SimpleNamespace(required=False),
+        ),
+    )
+
+    loop_result = AgentLoopResult(
+        status="COMPLETED",
+        steps=1,
+        last_result=real_shaped_tool_result,
+        reason="Done.",
+        context=AgentContext(task="x"),
+    )
+
+    evaluation = kernel._evaluate_policy(loop_result)
+
+    assert evaluation == ExternalActionEvaluation(
+        action="INJECTED",
+        subject="INJECTED",
+        tool_id="INJECTED",
+        risk_level="INJECTED",
+        approval_required=True,
+        verification_required=False,
+    )

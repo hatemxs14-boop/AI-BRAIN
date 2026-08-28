@@ -106,6 +106,9 @@ class MockToolRuntime:
             next_actions=(),
             artifacts=("SEARCH RESULT",),
             security_decision=None,
+            subject=invocation.subject,
+            tool_id=invocation.tool_id,
+            action="search",
         )
 
 
