@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import json
+import shutil
+import tempfile
+from pathlib import Path
+
 from core.security.engine.security_decision import SecurityDecisionPoint
 
 from core.tools.engine.tool_gateway import ToolGateway
@@ -19,10 +24,54 @@ from core.tools.runtime.tool_runtime import (
 )
 
 
-PERMISSIONS_FILE = "core/security/schemas/permissions.json"
+def _write_isolated_policy(tmp_dir: Path) -> Path:
+    """
+    A minimal, self-contained permissions.json granting both
+    permissions this file's tests need: research_agent's real
+    web_search grant (kept in sync with the production LOW-risk
+    entry), plus a HIGH-risk research_agent shell grant that the
+    real production policy no longer has (see core.agents.
+    research_agent's module docstring) but the approval-preservation
+    tests below still need as fixture data. Isolating this file from
+    the real policy decouples these generic plumbing tests from the
+    evolving real-world security policy content -- the same pattern
+    already used in tests/security/test_effective_risk_floor.py.
+    """
+
+    policy = {
+        "version": "1.0",
+        "permissions": [
+            {
+                "subject": "research_agent",
+                "resource": "web_search",
+                "action": "search",
+                "scope": "public_web",
+                "risk_level": "LOW",
+                "approval": "none",
+            },
+            {
+                "subject": "research_agent",
+                "resource": "shell",
+                "action": "execute",
+                "scope": "workspace",
+                "risk_level": "HIGH",
+                "approval": "policy",
+            },
+        ],
+        "defaults": {
+            "unknown_risk": "DENY",
+            "unknown_permission": "DENY",
+            "unknown_scope": "DENY",
+            "authorization_failure": "DENY",
+        },
+    }
+
+    policy_path = tmp_dir / "permissions.json"
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    return policy_path
 
 
-def build_gateway():
+def build_gateway(tmp_dir: Path):
     registry = ToolRegistry()
 
     registry.register(
@@ -93,7 +142,12 @@ def build_gateway():
         )
     )
 
-    security = SecurityDecisionPoint(PERMISSIONS_FILE)
+    policy_path = _write_isolated_policy(tmp_dir)
+
+    security = SecurityDecisionPoint(
+        policy_path=str(policy_path),
+        audit_log_path=str(tmp_dir / "audit.jsonl"),
+    )
 
     gateway = ToolGateway(
         security=security,
@@ -104,121 +158,137 @@ def build_gateway():
 
 
 def test_runtime_executes_tool_through_gateway():
-    registry, gateway = build_gateway()
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        registry, gateway = build_gateway(tmp_dir)
 
-    gateway.register_executor(
-        tool_id="web_search",
-        executor=lambda query: "RUNTIME TEST: " + query,
-    )
+        gateway.register_executor(
+            tool_id="web_search",
+            executor=lambda query: "RUNTIME TEST: " + query,
+        )
 
-    runtime = ToolRuntime(
-        registry=registry,
-        gateway=gateway,
-    )
+        runtime = ToolRuntime(
+            registry=registry,
+            gateway=gateway,
+        )
 
-    invocation = ToolInvocation(
-        subject="research_agent",
-        tool_id="web_search",
-        inputs={
-            "query": "AI agents",
-        },
-    )
+        invocation = ToolInvocation(
+            subject="research_agent",
+            tool_id="web_search",
+            inputs={
+                "query": "AI agents",
+            },
+        )
 
-    result = runtime.execute(invocation)
+        result = runtime.execute(invocation)
 
-    assert result.status == "SUCCESS"
-    assert result.artifacts == (
-        "RUNTIME TEST: AI agents",
-    )
+        assert result.status == "SUCCESS"
+        assert result.artifacts == (
+            "RUNTIME TEST: AI agents",
+        )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def test_runtime_rejects_invalid_invocation_type():
-    registry, gateway = build_gateway()
-
-    runtime = ToolRuntime(
-        registry=registry,
-        gateway=gateway,
-    )
-
+    tmp_dir = Path(tempfile.mkdtemp())
     try:
-        runtime.execute("invalid")
-    except TypeError as exc:
-        assert "ToolInvocation" in str(exc)
-    else:
-        raise AssertionError(
-            "Runtime accepted an invalid invocation type."
+        registry, gateway = build_gateway(tmp_dir)
+
+        runtime = ToolRuntime(
+            registry=registry,
+            gateway=gateway,
         )
+
+        try:
+            runtime.execute("invalid")
+        except TypeError as exc:
+            assert "ToolInvocation" in str(exc)
+        else:
+            raise AssertionError(
+                "Runtime accepted an invalid invocation type."
+            )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def test_runtime_discovery_hides_executor():
-    registry, gateway = build_gateway()
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        registry, gateway = build_gateway(tmp_dir)
 
-    gateway.register_executor(
-        tool_id="web_search",
-        executor=lambda query: "SECRET EXECUTOR",
-    )
+        gateway.register_executor(
+            tool_id="web_search",
+            executor=lambda query: "SECRET EXECUTOR",
+        )
 
-    runtime = ToolRuntime(
-        registry=registry,
-        gateway=gateway,
-    )
+        runtime = ToolRuntime(
+            registry=registry,
+            gateway=gateway,
+        )
 
-    discovery = runtime.discover_tool(
-        "web_search"
-    )
+        discovery = runtime.discover_tool(
+            "web_search"
+        )
 
-    assert isinstance(
-        discovery,
-        ToolDiscovery,
-    )
+        assert isinstance(
+            discovery,
+            ToolDiscovery,
+        )
 
-    assert discovery.id == "web_search"
-    assert discovery.name == "Web Search"
-    assert discovery.risk_level == "LOW"
+        assert discovery.id == "web_search"
+        assert discovery.name == "Web Search"
+        assert discovery.risk_level == "LOW"
 
-    assert not hasattr(
-        discovery,
-        "executor",
-    )
+        assert not hasattr(
+            discovery,
+            "executor",
+        )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def test_runtime_filters_tools_by_subject():
-    registry, gateway = build_gateway()
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        registry, gateway = build_gateway(tmp_dir)
 
-    runtime = ToolRuntime(
-        registry=registry,
-        gateway=gateway,
-    )
-
-    research_tools = (
-        runtime.discover_tools_for_subject(
-            "research_agent"
+        runtime = ToolRuntime(
+            registry=registry,
+            gateway=gateway,
         )
-    )
 
-    admin_tools = (
-        runtime.discover_tools_for_subject(
-            "admin_agent"
+        research_tools = (
+            runtime.discover_tools_for_subject(
+                "research_agent"
+            )
         )
-    )
 
-    research_ids = tuple(
-        tool.id
-        for tool in research_tools
-    )
+        admin_tools = (
+            runtime.discover_tools_for_subject(
+                "admin_agent"
+            )
+        )
 
-    admin_ids = tuple(
-        tool.id
-        for tool in admin_tools
-    )
+        research_ids = tuple(
+            tool.id
+            for tool in research_tools
+        )
 
-    assert research_ids == (
-        "web_search",
-    )
+        admin_ids = tuple(
+            tool.id
+            for tool in admin_tools
+        )
 
-    assert admin_ids == (
-        "shell",
-    )
+        assert research_ids == (
+            "web_search",
+        )
+
+        assert admin_ids == (
+            "shell",
+        )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def test_runtime_does_not_execute_invalid_input():
@@ -226,53 +296,61 @@ def test_runtime_does_not_execute_invalid_input():
         "called": False,
     }
 
-    registry, gateway = build_gateway()
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        registry, gateway = build_gateway(tmp_dir)
 
-    gateway.register_executor(
-        tool_id="web_search",
-        executor=lambda query: (
-            execution_state.__setitem__(
-                "called",
-                True,
-            ),
-            "SHOULD NOT EXECUTE",
-        )[1],
-    )
+        gateway.register_executor(
+            tool_id="web_search",
+            executor=lambda query: (
+                execution_state.__setitem__(
+                    "called",
+                    True,
+                ),
+                "SHOULD NOT EXECUTE",
+            )[1],
+        )
 
-    runtime = ToolRuntime(
-        registry=registry,
-        gateway=gateway,
-    )
+        runtime = ToolRuntime(
+            registry=registry,
+            gateway=gateway,
+        )
 
-    invocation = ToolInvocation(
-        subject="research_agent",
-        tool_id="web_search",
-        inputs={},
-    )
+        invocation = ToolInvocation(
+            subject="research_agent",
+            tool_id="web_search",
+            inputs={},
+        )
 
-    result = runtime.execute(invocation)
+        result = runtime.execute(invocation)
 
-    assert result.status == "INVALID_INPUT"
-    assert execution_state["called"] is False
+        assert result.status == "INVALID_INPUT"
+        assert execution_state["called"] is False
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def test_runtime_blocks_unknown_tool():
-    registry, gateway = build_gateway()
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        registry, gateway = build_gateway(tmp_dir)
 
-    runtime = ToolRuntime(
-        registry=registry,
-        gateway=gateway,
-    )
+        runtime = ToolRuntime(
+            registry=registry,
+            gateway=gateway,
+        )
 
-    invocation = ToolInvocation(
-        subject="research_agent",
-        tool_id="unknown_tool",
-        inputs={},
-    )
+        invocation = ToolInvocation(
+            subject="research_agent",
+            tool_id="unknown_tool",
+            inputs={},
+        )
 
-    result = runtime.execute(invocation)
+        result = runtime.execute(invocation)
 
-    assert result.status == "DENIED"
+        assert result.status == "DENIED"
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def test_runtime_preserves_high_risk_approval():
@@ -280,66 +358,74 @@ def test_runtime_preserves_high_risk_approval():
         "called": False,
     }
 
-    registry, gateway = build_gateway()
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        registry, gateway = build_gateway(tmp_dir)
 
-    gateway.register_executor(
-        tool_id="shell",
-        executor=lambda command: (
-            execution_state.__setitem__(
-                "called",
-                True,
-            ),
-            "SHELL EXECUTED",
-        )[1],
-    )
+        gateway.register_executor(
+            tool_id="shell",
+            executor=lambda command: (
+                execution_state.__setitem__(
+                    "called",
+                    True,
+                ),
+                "SHELL EXECUTED",
+            )[1],
+        )
 
-    runtime = ToolRuntime(
-        registry=registry,
-        gateway=gateway,
-    )
+        runtime = ToolRuntime(
+            registry=registry,
+            gateway=gateway,
+        )
 
-    invocation = ToolInvocation(
-        subject="research_agent",
-        tool_id="shell",
-        inputs={
-            "command": "echo test",
-        },
-    )
+        invocation = ToolInvocation(
+            subject="research_agent",
+            tool_id="shell",
+            inputs={
+                "command": "echo test",
+            },
+        )
 
-    result = runtime.execute(invocation)
+        result = runtime.execute(invocation)
 
-    assert result.status == "APPROVAL_REQUIRED"
-    assert execution_state["called"] is False
+        assert result.status == "APPROVAL_REQUIRED"
+        assert execution_state["called"] is False
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def test_runtime_preserves_explicit_approval():
-    registry, gateway = build_gateway()
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        registry, gateway = build_gateway(tmp_dir)
 
-    gateway.register_executor(
-        tool_id="shell",
-        executor=lambda command: (
-            "APPROVED SHELL: " + command
-        ),
-    )
+        gateway.register_executor(
+            tool_id="shell",
+            executor=lambda command: (
+                "APPROVED SHELL: " + command
+            ),
+        )
 
-    runtime = ToolRuntime(
-        registry=registry,
-        gateway=gateway,
-    )
+        runtime = ToolRuntime(
+            registry=registry,
+            gateway=gateway,
+        )
 
-    invocation = ToolInvocation(
-        subject="research_agent",
-        tool_id="shell",
-        inputs={
-            "command": "echo approved",
-        },
-        approved=True,
-        approved_by="human_operator",
-    )
+        invocation = ToolInvocation(
+            subject="research_agent",
+            tool_id="shell",
+            inputs={
+                "command": "echo approved",
+            },
+            approved=True,
+            approved_by="human_operator",
+        )
 
-    result = runtime.execute(invocation)
+        result = runtime.execute(invocation)
 
-    assert result.status == "SUCCESS"
-    assert result.artifacts == (
-        "APPROVED SHELL: echo approved",
-    )
+        assert result.status == "SUCCESS"
+        assert result.artifacts == (
+            "APPROVED SHELL: echo approved",
+        )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)

@@ -11,17 +11,17 @@
     },
     {
       "subject": "research_agent",
-      "resource": "shell",
-      "action": "execute",
-      "scope": "workspace",
-      "risk_level": "HIGH",
-      "approval": "policy"
-    },
-    {
-      "subject": "research_agent",
       "resource": "document",
       "action": "read",
       "scope": "workspace",
+      "risk_level": "LOW",
+      "approval": "none"
+    },
+    {
+      "subject": "research_agent",
+      "resource": "webpage",
+      "action": "read",
+      "scope": "public_web",
       "risk_level": "LOW",
       "approval": "none"
     }

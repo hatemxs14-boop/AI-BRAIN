@@ -49,6 +49,12 @@ from core.tools.implementations.web_search_tool import (
     create_serper_web_search_executor,
 )
 
+from core.tools.implementations.webpage_read_tool import (
+    READ_WEBPAGE_TOOL,
+    READ_WEBPAGE_TOOL_ID,
+    create_webpage_read_executor,
+)
+
 from core.tools.registry.tool_registry import (
     ToolRegistry,
 )
@@ -72,7 +78,7 @@ from core.tools.runtime.tool_runtime import (
 # executors here really do something instead of returning a canned
 # string.
 #
-# Real tools wired here (both LOW risk_level -- auto-execute, no
+# Real tools wired here (all three LOW risk_level -- auto-execute, no
 # approval required):
 #
 #   web_search      resource=web_search   action=search  scope=public_web
@@ -83,26 +89,36 @@ from core.tools.runtime.tool_runtime import (
 #                    -> core.tools.implementations.document_read_tool
 #                       (real, sandboxed plain-text/Markdown file read)
 #
-# Deliberately NOT wired: permissions.json also grants research_agent a
-# HIGH-risk permission for resource=shell/action=execute/scope=
-# workspace (present since Pass 1's test fixtures, unrelated to this
-# build phase). RESEARCH_AGENT.md's own "Tools" section lists only
-# "approved read-only search tools" and "approved document/file
-# reading tools" as allowed, explicitly forbids "destructive
-# filesystem tools", and never mentions command execution as an
-# allowed capability at all -- shell execution is not "destructive"
-# by definition, but it is also nowhere on the agent's allowed list,
-# and there is no legitimate research-agent use case this build phase
-# identified for it. Rather than either (a) silently building a real
-# shell executor the spec never asked for, or (b) editing
-# permissions.json to remove a grant that may exist for a future,
-# different subject/tool, this module simply never registers a
-# ToolDefinition for resource=shell here: no ToolDefinition means
-# nothing is exposed through discover_tools_for_subject(), so the
-# latent permission grants nothing today. This should be resolved
-# explicitly (wire a real, scoped shell tool, or drop the permission
-# entry) before research_agent is given any task that could plausibly
-# call for command execution.
+#   read_webpage    resource=webpage      action=read    scope=public_web
+#                    -> core.tools.implementations.webpage_read_tool
+#                       (real HTTP GET of one public URL, HTML reduced
+#                       to plain text -- closes the gap web_search
+#                       leaves open, since web_search only ever returns
+#                       title/link/snippet and never the page content
+#                       itself; see that module's own docstring for its
+#                       SSRF-defense design and one documented
+#                       limitation)
+#
+# Resolved contradiction: permissions.json used to also grant
+# research_agent a HIGH-risk permission for resource=shell/
+# action=execute/scope=workspace (present since Pass 1's test
+# fixtures, unrelated to this build phase). RESEARCH_AGENT.md's own
+# "Tools" section lists only "approved read-only search tools" and
+# "approved document/file reading tools" as allowed, explicitly
+# forbids "destructive filesystem tools", and never mentions command
+# execution as an allowed capability at all -- there was no legitimate
+# research-agent use case for shell execution, so rather than build a
+# real shell executor the spec never asked for, the shell permission
+# entry has been removed from permissions.json entirely. research_agent
+# now holds no shell-related permission of any kind: even a direct,
+# hand-built ToolInvocation for resource=shell against this subject is
+# denied by AuthorizationEngine at the policy layer, on top of this
+# module never registering a ToolDefinition for it (which already kept
+# it out of discover_tools_for_subject()). No further action is needed
+# here; if a future build phase adds real command-execution capability
+# for research_agent, it should be introduced as a new, explicitly
+# scoped/whitelisted tool with its own permission entry and its own
+# executor, not by restoring this one.
 # ---------------------------------------------------------------------
 
 RESEARCH_AGENT_SUBJECT = "research_agent"
@@ -137,6 +153,7 @@ def build_research_agent(
 
     registry.register(WEB_SEARCH_TOOL)
     registry.register(READ_DOCUMENT_TOOL)
+    registry.register(READ_WEBPAGE_TOOL)
 
     security_kwargs: dict[str, Any] = {}
 
@@ -165,6 +182,11 @@ def build_research_agent(
         executor=create_document_read_executor(
             documents_root,
         ),
+    )
+
+    gateway.register_executor(
+        tool_id=READ_WEBPAGE_TOOL_ID,
+        executor=create_webpage_read_executor(),
     )
 
     runtime = ToolRuntime(

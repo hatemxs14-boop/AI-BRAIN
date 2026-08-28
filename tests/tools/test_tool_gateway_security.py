@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import json
+import shutil
+import tempfile
+from pathlib import Path
+
 from core.security.engine.security_decision import SecurityDecisionPoint
 
 from core.tools.engine.tool_gateway import ToolGateway
@@ -11,6 +16,42 @@ from core.tools.registry.tool_registry import (
 
 
 PERMISSIONS_FILE = "core/security/schemas/permissions.json"
+
+
+def _write_isolated_shell_policy(tmp_dir: Path) -> Path:
+    """
+    A minimal, self-contained permissions.json granting exactly the
+    HIGH-risk shell permission test_high_risk_requires_approval needs,
+    isolated from the real project policy (which no longer grants
+    research_agent any shell-related permission -- see core.agents.
+    research_agent's module docstring). Every other test in this file
+    uses the real PERMISSIONS_FILE via build_gateway() and is
+    unaffected.
+    """
+
+    policy = {
+        "version": "1.0",
+        "permissions": [
+            {
+                "subject": "research_agent",
+                "resource": "shell",
+                "action": "execute",
+                "scope": "workspace",
+                "risk_level": "HIGH",
+                "approval": "policy",
+            }
+        ],
+        "defaults": {
+            "unknown_risk": "DENY",
+            "unknown_permission": "DENY",
+            "unknown_scope": "DENY",
+            "authorization_failure": "DENY",
+        },
+    }
+
+    policy_path = tmp_dir / "permissions.json"
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    return policy_path
 
 
 def build_gateway(
@@ -289,62 +330,71 @@ def test_high_risk_requires_approval():
         execution_state["called"] = True
         return "SHELL EXECUTED"
 
-    registry = ToolRegistry()
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        registry = ToolRegistry()
 
-    registry.register(
-        ToolDefinition(
-            id="shell",
-            name="Shell",
-            purpose="Execute a shell command.",
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                    }
+        registry.register(
+            ToolDefinition(
+                id="shell",
+                name="Shell",
+                purpose="Execute a shell command.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                        }
+                    },
+                    "required": ["command"],
+                    "additionalProperties": False,
                 },
-                "required": ["command"],
-                "additionalProperties": False,
-            },
-            output_schema={
-                "type": "string",
-            },
-            permissions=(
-                "research_agent:shell:execute:workspace",
-            ),
-            resource="shell",
-            action="execute",
-            scope="workspace",
-            risk_level="HIGH",
-            error_handling={
-                "retryable": False,
-                "on_failure": (
-                    "Do not retry a shell command automatically; "
-                    "surface the failure for human review."
+                output_schema={
+                    "type": "string",
+                },
+                permissions=(
+                    "research_agent:shell:execute:workspace",
                 ),
+                resource="shell",
+                action="execute",
+                scope="workspace",
+                risk_level="HIGH",
+                error_handling={
+                    "retryable": False,
+                    "on_failure": (
+                        "Do not retry a shell command automatically; "
+                        "surface the failure for human review."
+                    ),
+                },
+            )
+        )
+
+        policy_path = _write_isolated_shell_policy(tmp_dir)
+
+        security = SecurityDecisionPoint(
+            policy_path=str(policy_path),
+            audit_log_path=str(tmp_dir / "audit.jsonl"),
+        )
+
+        gateway = ToolGateway(
+            security=security,
+            registry=registry,
+        )
+
+        gateway.register_executor(
+            tool_id="shell",
+            executor=shell_executor,
+        )
+
+        result = gateway.execute(
+            subject="research_agent",
+            tool_id="shell",
+            tool_kwargs={
+                "command": "echo test",
             },
         )
-    )
 
-    security = SecurityDecisionPoint(PERMISSIONS_FILE)
-
-    gateway = ToolGateway(
-        security=security,
-        registry=registry,
-    )
-
-    gateway.register_executor(
-        tool_id="shell",
-        executor=shell_executor,
-    )
-
-    result = gateway.execute(
-        subject="research_agent",
-        tool_id="shell",
-        tool_kwargs={
-            "command": "echo test",
-        },
-    )
-
-    assert result.status == "APPROVAL_REQUIRED"
-    assert execution_state["called"] is False
+        assert result.status == "APPROVAL_REQUIRED"
+        assert execution_state["called"] is False
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
