@@ -48,6 +48,22 @@
       "scope": "workspace",
       "risk_level": "HIGH",
       "approval": "policy"
+    },
+    {
+      "subject": "reviewer_agent",
+      "resource": "research_findings",
+      "action": "read",
+      "scope": "workspace",
+      "risk_level": "LOW",
+      "approval": "none"
+    },
+    {
+      "subject": "reviewer_agent",
+      "resource": "report",
+      "action": "read",
+      "scope": "workspace",
+      "risk_level": "LOW",
+      "approval": "none"
     }
   ],
   "defaults": {

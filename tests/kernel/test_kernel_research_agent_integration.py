@@ -79,12 +79,12 @@ def _make_findings_root() -> str:
     return tempfile.mkdtemp()
 
 
-def test_build_default_kernel_registers_both_agents():
+def test_build_default_kernel_registers_all_three_agents():
     """
-    As of Build Phase 8, build_default_kernel() registers both
-    research_agent and writer_agent, research_agent first (see
-    core/kernel/default_kernel.py's own docstring for why registration
-    order matters as the genuine-tie tiebreak).
+    As of Build Phase 11, build_default_kernel() registers
+    research_agent, writer_agent, and reviewer_agent, in that order
+    (see core/kernel/default_kernel.py's own docstring for why
+    registration order matters as the genuine-tie tiebreak).
     """
     docs_root = _make_documents_root()
     findings_root = _make_findings_root()
@@ -104,6 +104,7 @@ def test_build_default_kernel_registers_both_agents():
         assert [r.subject for r in kernel._registrations] == [
             "research_agent",
             "writer_agent",
+            "reviewer_agent",
         ]
     finally:
         shutil.rmtree(docs_root)

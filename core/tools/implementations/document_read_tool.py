@@ -20,6 +20,23 @@ from core.tools.registry.tool_registry import ToolDefinition
 # passes' test fixtures) -- a new
 # research_agent:document:read:workspace / risk_level=LOW entry was
 # added alongside this module.
+#
+# Windows CRLF fix (Build Phase 11 delivery cycle): a real `pytest -v`
+# run on the user's Windows machine caught a genuine cross-platform
+# bug this project's Linux sandbox structurally could not (the same
+# class of environment-only bug as Pass 1's own #5/#9) -- `Path.
+# read_text(encoding="utf-8")`'s default universal-newline mode
+# silently translates on-disk "\r\n" to "\n" on every platform, so a
+# multi-line file written with Windows line endings would read back
+# shorter, in bytes, than `candidate.stat().st_size` (computed from
+# the real on-disk size just above) actually reports -- an internal
+# inconsistency between this tool's own `content` and `size_bytes`
+# fields whenever a file happens to contain CRLF line endings.
+# `open(..., newline="")` disables that translation entirely, so
+# `content` always reflects exactly what is on disk, decoded as
+# UTF-8, on every platform (a no-op on Linux/macOS, where "\n" was
+# already unaffected by universal-newline translation -- which is why
+# this sandbox's own tests could never have caught it).
 # ---------------------------------------------------------------------
 
 READ_DOCUMENT_TOOL_ID = "read_document"
@@ -176,7 +193,8 @@ def create_document_read_executor(
             )
 
         try:
-            content = candidate.read_text(encoding="utf-8")
+            with open(candidate, "r", encoding="utf-8", newline="") as f:
+                content = f.read()
         except UnicodeDecodeError as exc:
             raise ValueError(
                 f"Document '{path}' is not valid UTF-8 text."

@@ -35,6 +35,21 @@ from core.tools.registry.tool_registry import ToolDefinition
 # rather than by convention. This is the first REAL (non-test) tool in
 # this project to exercise that approval-required path in production
 # use, rather than only in test fixtures.
+#
+# Windows CRLF fix (Build Phase 11 delivery cycle): a real `pytest -v`
+# run on the user's Windows machine caught a genuine cross-platform
+# bug this project's Linux sandbox structurally could not (the same
+# class of environment-only bug as Pass 1's own #5/#9) -- `Path.
+# write_text(content, encoding="utf-8")`'s default universal-newline
+# mode silently translates "\n" in `content` to the platform's own
+# line ending on write, so on Windows a multi-line write would land
+# on disk LARGER, in bytes, than the `size_bytes` this executor
+# already reports (`len(encoded)`, computed from `content` before any
+# platform translation). Writing through `open(..., newline="")`
+# instead disables that translation entirely, so the file on disk is
+# always exactly `encoded`'s bytes, on every platform (a no-op on
+# Linux/macOS, where "\n" was already unaffected -- which is why this
+# sandbox's own tests could never have caught it).
 # ---------------------------------------------------------------------
 
 WRITE_RESEARCH_FINDINGS_TOOL_ID = "write_research_findings"
@@ -199,7 +214,8 @@ def create_write_research_findings_executor(
 
         candidate.parent.mkdir(parents=True, exist_ok=True)
 
-        candidate.write_text(content, encoding="utf-8")
+        with open(candidate, "w", encoding="utf-8", newline="") as f:
+            f.write(content)
 
         return {
             "path": filename,

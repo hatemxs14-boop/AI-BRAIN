@@ -183,6 +183,53 @@ An agent must not:
 
 See core/agents/WRITER_AGENT.md for the full role specification.
 
+### reviewer_agent
+
+- id: reviewer_agent
+- name: Reviewer Agent
+- purpose: Independently verify an already-published report against the
+  research findings it claims to be based on.
+- capabilities:
+  - independent_verification
+  - claim_traceability_checking
+  - uncertainty_assessment
+- responsibilities:
+  - read a previously-published report
+  - read the research findings that report claims to draw on
+  - compare the report's claims against what the findings actually say
+  - identify claims the findings do not support
+  - identify findings the report ignored or contradicted
+  - report a confidence assessment for the review as a whole
+- inputs:
+  - the report to review
+  - the research findings to check it against
+  - relevant context
+- outputs:
+  - verdict
+  - unsupported_claims
+  - ignored_findings
+  - confidence
+- tools:
+  - approved read-only access to persisted research findings
+  - approved read-only access to published reports
+- memory_access:
+  - read approved research findings
+  - read approved reports
+- model_requirements:
+  - multi-document comparison
+  - claim-by-claim traceability checking
+  - uncertainty identification
+- risk_level: LOW
+- verification_requirements:
+  - confirm every flagged-supported claim traces back to a finding actually
+    read
+  - flag unsupported claims
+  - note findings the report never referenced
+  - report uncertainty
+- status: active
+
+See core/agents/REVIEWER_AGENT.md for the full role specification.
+
 The registry must only contain agents whose responsibilities, interfaces,
 tools, memory access, and verification requirements have been explicitly
 designed.
@@ -191,14 +238,16 @@ designed.
 
 ## Current Status
 
-**research_agent and writer_agent are both real, wired, and registered with
-the Kernel** (see core/kernel/default_kernel.py's `build_default_kernel()`
-and core/agents/research_agent.py / core/agents/writer_agent.py) as of Build
-Phase 8. This registry document itself remains the authoritative catalog of
-declared capabilities/boundaries; the `status: proposed` value on
-research_agent's own entry above is a known, pre-existing documentation
-staleness (never updated after Build Phase 1 wired it up) rather than a
-current gap -- left as-is here rather than silently corrected, per this
-project's practice of naming documentation inconsistencies instead of
-quietly rewriting history (see the repo baseline doc's Pass 4 section for
-other examples of documented-not-fixed spec inconsistencies).
+**research_agent, writer_agent, and reviewer_agent are all real, wired, and
+registered with the Kernel** (see core/kernel/default_kernel.py's
+`build_default_kernel()` and core/agents/research_agent.py /
+core/agents/writer_agent.py / core/agents/reviewer_agent.py) as of Build
+Phase 11, completing a research -> write -> review pipeline. This registry
+document itself remains the authoritative catalog of declared
+capabilities/boundaries; the `status: proposed` value on research_agent's
+own entry above is a known, pre-existing documentation staleness (never
+updated after Build Phase 1 wired it up) rather than a current gap --
+left as-is here rather than silently corrected, per this project's practice
+of naming documentation inconsistencies instead of quietly rewriting
+history (see the repo baseline doc's Pass 4 section for other examples of
+documented-not-fixed spec inconsistencies).

@@ -30,6 +30,28 @@ from core.tools.registry.tool_registry import ToolDefinition
 # sharing a helper) -- every tool's full security-relevant logic is
 # meant to be readable/auditable in one file without chasing a shared
 # base across tool boundaries.
+#
+# Second subject, Build Phase 11: reviewer_agent independently
+# verifies a published report against the same persisted findings
+# writer_agent reads -- genuinely the same resource, same root, same
+# trust boundary, not a distinct capability that needs its own tool
+# module the way writer_agent's own read access (a different resource
+# entirely from research_agent's document:read:workspace) did. This
+# ToolDefinition's `permissions` tuple therefore now names BOTH
+# subjects explicitly (never implicitly -- each grant below is its
+# own visible, auditable string, and permissions.json separately
+# grants each subject its own real authorization entry). Discovery
+# filtering (ToolRuntime._subject_has_capability) checks for an exact
+# "{subject}:" prefix match, so adding reviewer_agent's own grant
+# string here does not change what writer_agent can discover, and a
+# subject with neither grant (e.g. research_agent) still cannot
+# discover or invoke this tool at all.
+#
+# Windows CRLF fix (Build Phase 11 delivery cycle): see
+# document_read_tool.py's own docstring for the full explanation --
+# the same "\r\n silently becomes \n on read, but size_bytes is
+# computed from the real on-disk stat() size" inconsistency applied
+# here too, and is fixed here the same way (`open(..., newline="")`).
 # ---------------------------------------------------------------------
 
 READ_RESEARCH_FINDINGS_TOOL_ID = "read_research_findings"
@@ -69,6 +91,7 @@ READ_RESEARCH_FINDINGS_TOOL = ToolDefinition(
     },
     permissions=(
         "writer_agent:research_findings:read:workspace",
+        "reviewer_agent:research_findings:read:workspace",
     ),
     resource="research_findings",
     action="read",
@@ -182,7 +205,8 @@ def create_read_research_findings_executor(
             )
 
         try:
-            content = candidate.read_text(encoding="utf-8")
+            with open(candidate, "r", encoding="utf-8", newline="") as f:
+                content = f.read()
         except UnicodeDecodeError as exc:
             raise ValueError(
                 f"Research finding '{filename}' is not valid UTF-8 "

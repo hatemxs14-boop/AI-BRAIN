@@ -24,6 +24,10 @@ from core.agents.writer_agent import (
     build_writer_agent,
 )
 
+from core.agents.reviewer_agent import (
+    build_reviewer_agent,
+)
+
 from core.kernel.kernel import (
     AgentRegistration,
     Kernel,
@@ -44,29 +48,32 @@ from core.policies.policy_engine import (
 
 
 # ---------------------------------------------------------------------
-# Convenience wiring: a Kernel with both research_agent and
-# writer_agent registered (Build Phase 8), the same way
-# core/agents/research_agent.py's own build_research_agent() and
-# core/agents/writer_agent.py's own build_writer_agent() are
+# Convenience wiring: a Kernel with research_agent, writer_agent, and
+# (as of Build Phase 11) reviewer_agent all registered, the same way
+# core/agents/research_agent.py's own build_research_agent(),
+# core/agents/writer_agent.py's own build_writer_agent(), and
+# core/agents/reviewer_agent.py's own build_reviewer_agent() are
 # convenience wirings of each agent's own tool/security stack.
 #
 # Until Build Phase 8, research_agent was this project's only
 # registered agent, so its `can_handle` was `_always_handles`
 # (accepted every task) -- Kernel._classify() had nothing to actually
-# classify between. With a second agent now registered, both
+# classify between. With three agents now registered, all three
 # predicates below are real: a finite, hand-maintained keyword
 # vocabulary per agent, in the same spirit as RiskEngine's own
 # keyword-heuristic classification (Pass 3 finding I) -- not a real
 # NLU classifier (no such subsystem exists in this project), but a
 # genuine, testable discriminator rather than the previous
-# accept-everything placeholder. A task matching both vocabularies (or
-# neither) is handled exactly as Kernel._classify()/_select_agent()
-# already document: every match is collected, and the first in
-# registration order is selected (research_agent is registered first,
-# so it wins a genuine tie) -- STRATEGY SELECTION remains "run one
-# matching agent", unchanged by this phase; only which agents can
-# match at all is new. See Kernel._classify()'s own docstring in
-# core/kernel/kernel.py for the unchanged selection mechanism itself.
+# accept-everything placeholder. A task matching more than one
+# vocabulary (or none) is handled exactly as
+# Kernel._classify()/_select_agent() already document: every match is
+# collected, and the first in registration order is selected
+# (research_agent first, then writer_agent, then reviewer_agent, so an
+# earlier-registered agent wins a genuine tie) -- STRATEGY SELECTION
+# remains "run one matching agent", unchanged by this phase; only
+# which agents can match at all is new. See Kernel._classify()'s own
+# docstring in core/kernel/kernel.py for the unchanged selection
+# mechanism itself.
 #
 # Matching is whole-word, not plain substring: a first draft of this
 # module matched keywords with a plain `keyword in text` check, and
@@ -80,6 +87,25 @@ from core.policies.policy_engine import (
 # so "find" no longer matches inside "finding" (no word boundary
 # between "find" and the following "ing"), while multi-word phrases
 # like "read document" still match as a whole phrase.
+#
+# Build Phase 11 added a third agent, reviewer_agent, and caught a
+# second vocabulary-overlap problem of the same kind before it ever
+# shipped: reviewer_agent's whole domain is verifying a *report*, so
+# almost any realistic review task ("review the report", "verify the
+# report's claims") contains the word "report" -- which
+# _WRITER_AGENT_KEYWORDS previously listed as a standalone trigger.
+# Since research_agent is registered first, writer_agent second, and
+# reviewer_agent third, a task matching both writer_agent's and
+# reviewer_agent's vocabulary would have been a "genuine tie" that
+# always resolved to writer_agent (registration order), silently
+# starving reviewer_agent of almost every realistic phrasing of its
+# own job. Checked directly against the test suite before removing
+# it: no test relied on the bare word "report" alone triggering
+# writer_agent (every existing writer_agent test task already
+# contains "draft"/"summarize"/"write" too), so "report" was removed
+# from _WRITER_AGENT_KEYWORDS entirely -- writer_agent is now reached
+# only by its own drafting/publishing verbs, and reviewer_agent's own
+# verification verbs no longer collide with it.
 # ---------------------------------------------------------------------
 
 
@@ -99,11 +125,24 @@ _RESEARCH_AGENT_KEYWORDS: tuple[str, ...] = (
 _WRITER_AGENT_KEYWORDS: tuple[str, ...] = (
     "write",
     "draft",
-    "report",
     "summarize",
     "summarise",
     "summary",
     "compose",
+)
+
+_REVIEWER_AGENT_KEYWORDS: tuple[str, ...] = (
+    "review",
+    "verify",
+    "audit",
+    "validate",
+    "critique",
+    "fact-check",
+    "fact check",
+    "double-check",
+    "double check",
+    "cross-check",
+    "cross check",
 )
 
 
@@ -147,6 +186,20 @@ def _writer_agent_handles(normalized: NormalizedTask) -> bool:
     return _contains_keyword(normalized.text.lower(), _WRITER_AGENT_KEYWORDS)
 
 
+def _reviewer_agent_handles(normalized: NormalizedTask) -> bool:
+    """
+    Real (v1) capability predicate for reviewer_agent: matches when
+    the normalized task text contains any of a finite, hand-maintained
+    set of independent-verification keywords, as a whole word or
+    phrase (see _contains_keyword). See this module's own docstring
+    for why this is a deliberate keyword heuristic, not a real NLU
+    classifier, and for the "report" vocabulary-overlap problem this
+    agent's addition surfaced and fixed on _WRITER_AGENT_KEYWORDS.
+    """
+
+    return _contains_keyword(normalized.text.lower(), _REVIEWER_AGENT_KEYWORDS)
+
+
 def build_default_kernel(
     *,
     llm_client_factory: Callable[[], LLMClient] | None = None,
@@ -165,8 +218,8 @@ def build_default_kernel(
     policy_engine: PolicyEngine | None = None,
 ) -> Kernel:
     """
-    Build a Kernel with both research_agent and writer_agent already
-    registered.
+    Build a Kernel with research_agent, writer_agent, and
+    reviewer_agent all already registered.
 
     Provide exactly one of `llm_client_factory` (a zero-argument
     callable returning a fresh LLMClient; wrapped in a fresh
@@ -175,10 +228,10 @@ def build_default_kernel(
     zero-argument callable returning a fresh AgentDecisionEngine
     directly -- e.g. a DeterministicDecisionEngine for testing, or a
     caller-configured LLMDecisionEngine). The same factory is shared by
-    both agents -- it only encapsulates which model/client is used,
-    never per-agent state (each Kernel.run() attempt calls it fresh via
-    the selected AgentRegistration's own build_decision_engine, per
-    AgentRegistration's own docstring).
+    all three agents -- it only encapsulates which model/client is
+    used, never per-agent state (each Kernel.run() attempt calls it
+    fresh via the selected AgentRegistration's own
+    build_decision_engine, per AgentRegistration's own docstring).
 
     A *factory* is required, not an instance, for the same reason
     AgentRegistration.build_agent is a factory: a decision engine (or
@@ -193,8 +246,11 @@ def build_default_kernel(
     the SAME parameter research_agent writes into, so writer_agent
     reads exactly what research_agent has actually persisted (see
     core/agents/writer_agent.py's own docstring for this pipeline
-    link). `permissions_path`/`audit_log_path` are shared by both
-    agents' security stacks.
+    link). `findings_root`/`reports_root` are likewise passed straight
+    through to build_reviewer_agent(), so reviewer_agent reads exactly
+    the same findings writer_agent read and exactly what writer_agent
+    has actually published. `permissions_path`/`audit_log_path` are
+    shared by all three agents' security stacks.
 
     `policy_engine` is passed straight through to Kernel() -- see its
     own docstring (core/kernel/kernel.py). Defaults to a fresh
@@ -244,6 +300,14 @@ def build_default_kernel(
             audit_log_path=audit_log_path,
         )
 
+    def build_reviewer():
+        return build_reviewer_agent(
+            findings_root=findings_root,
+            reports_root=reports_root,
+            permissions_path=permissions_path,
+            audit_log_path=audit_log_path,
+        )
+
     kernel = Kernel(
         orchestration_engine=orchestration_engine,
         max_recovery_attempts=max_recovery_attempts,
@@ -275,6 +339,20 @@ def build_default_kernel(
             ),
             can_handle=_writer_agent_handles,
             build_agent=build_writer,
+            build_decision_engine=decision_engine_factory,
+        )
+    )
+
+    kernel.register_agent(
+        AgentRegistration(
+            subject="reviewer_agent",
+            description=(
+                "Independently verifies an already-published report "
+                "against the research findings it claims to be based "
+                "on. See core/agents/REVIEWER_AGENT.md."
+            ),
+            can_handle=_reviewer_agent_handles,
+            build_agent=build_reviewer,
             build_decision_engine=decision_engine_factory,
         )
     )

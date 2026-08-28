@@ -112,6 +112,33 @@ def test_executor_writes_a_new_report():
         workspace.cleanup()
 
 
+def test_executor_writes_multiline_content_byte_exact_no_platform_translation():
+    """
+    Windows CRLF fix (Build Phase 11 delivery cycle, caught by a real
+    pytest -v run on the user's Windows machine): mirrors
+    test_write_research_findings_tool.py's own equivalent test -- see
+    its docstring for the full explanation. Reads the file back as
+    raw bytes (never through any text-mode API that could itself
+    apply translation and mask the bug).
+    """
+    workspace = _TempWorkspace()
+    try:
+        executor = create_write_report_executor(workspace.root)
+
+        content = "# Report\n\nLine two.\nLine three."
+        result = executor(
+            filename="report_multiline.md",
+            content=content,
+        )
+
+        assert result["size_bytes"] == len(content.encode("utf-8"))
+
+        raw = Path(workspace.root, "report_multiline.md").read_bytes()
+        assert raw == content.encode("utf-8")
+    finally:
+        workspace.cleanup()
+
+
 def test_executor_writes_into_a_subdirectory_of_root():
     workspace = _TempWorkspace()
     try:

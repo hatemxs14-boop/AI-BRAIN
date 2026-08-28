@@ -113,6 +113,40 @@ def test_executor_writes_a_new_finding():
         workspace.cleanup()
 
 
+def test_executor_writes_multiline_content_byte_exact_no_platform_translation():
+    """
+    Windows CRLF fix (Build Phase 11 delivery cycle, caught by a real
+    pytest -v run on the user's Windows machine): a plain
+    `Path.write_text(content, encoding="utf-8")` silently translates
+    "\\n" in `content` into the platform's own line ending on write
+    (CRLF on Windows), which would make the file on disk larger, in
+    bytes, than this tool's own reported `size_bytes` (computed from
+    `content` before any such translation). The executor now writes
+    via `open(..., newline="")` specifically to prevent that. This
+    test reads the file back as raw bytes (never through any text-mode
+    API that could itself apply translation and mask the bug) and
+    asserts they are exactly `content.encode("utf-8")` -- on Linux
+    this was already true before the fix (a no-op there), so this
+    test's real value is guaranteeing the same holds on Windows.
+    """
+    workspace = _TempWorkspace()
+    try:
+        executor = create_write_research_findings_executor(workspace.root)
+
+        content = "# Finding\n\nLine two.\nLine three."
+        result = executor(
+            filename="finding_multiline.md",
+            content=content,
+        )
+
+        assert result["size_bytes"] == len(content.encode("utf-8"))
+
+        raw = Path(workspace.root, "finding_multiline.md").read_bytes()
+        assert raw == content.encode("utf-8")
+    finally:
+        workspace.cleanup()
+
+
 def test_executor_writes_into_a_subdirectory_of_root():
     workspace = _TempWorkspace()
     try:

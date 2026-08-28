@@ -25,6 +25,13 @@ from core.tools.registry.tool_registry import ToolDefinition
 # MEDIUM assessment -- the same "explicitly authorized" gate write_
 # research_findings_tool.py already established, reused deliberately
 # rather than reinvented.
+#
+# Windows CRLF fix (Build Phase 11 delivery cycle): see
+# write_research_findings_tool.py's own docstring for the full
+# explanation -- the same "\n silently becomes the platform's own
+# line ending on write, but size_bytes is computed from content
+# before that translation" inconsistency applied here too, and is
+# fixed here the same way (`open(..., newline="")`).
 # ---------------------------------------------------------------------
 
 WRITE_REPORT_TOOL_ID = "write_report"
@@ -186,7 +193,8 @@ def create_write_report_executor(
 
         candidate.parent.mkdir(parents=True, exist_ok=True)
 
-        candidate.write_text(content, encoding="utf-8")
+        with open(candidate, "w", encoding="utf-8", newline="") as f:
+            f.write(content)
 
         return {
             "path": filename,

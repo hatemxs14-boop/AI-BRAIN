@@ -108,6 +108,34 @@ def test_executor_reads_an_existing_text_file():
         workspace.cleanup()
 
 
+def test_executor_reads_crlf_content_byte_exact_no_platform_translation():
+    """
+    Windows CRLF fix (Build Phase 11 delivery cycle, caught by a real
+    pytest -v run on the user's Windows machine while adding
+    core/tools/implementations/read_report_tool.py): before this fix,
+    reading via the platform default silently translated on-disk
+    "\\r\\n" to "\\n", which would make the returned `content`
+    shorter, in bytes, than `size_bytes` (computed from the real
+    on-disk `stat()` size). The fixture here writes literal "\\r\\n"
+    bytes directly (not through write_text(), whose own behavior is
+    platform-dependent) so this test is deterministic on every
+    platform, not just Windows.
+    """
+    workspace = _TempWorkspace()
+    try:
+        raw = b"Line one.\r\n\r\nLine two."
+        Path(workspace.root, "doc.txt").write_bytes(raw)
+
+        executor = create_document_read_executor(workspace.root)
+        result = executor(path="doc.txt")
+
+        assert result["content"] == raw.decode("utf-8")
+        assert result["size_bytes"] == len(raw)
+        assert len(result["content"].encode("utf-8")) == result["size_bytes"]
+    finally:
+        workspace.cleanup()
+
+
 def test_executor_reads_from_a_subdirectory_of_root():
     workspace = _TempWorkspace()
     try:

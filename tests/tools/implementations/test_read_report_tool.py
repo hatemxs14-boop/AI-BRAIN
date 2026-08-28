@@ -1,11 +1,10 @@
 """
-Tests for the real read_research_findings executor (core.tools.
-implementations.read_research_findings_tool), including the
-path-sandboxing rules that keep it from ever reading anything outside
-its configured root directory. Mirrors tests/tools/implementations/
-test_document_read_tool.py's structure closely -- this tool's
-sandboxing logic is a deliberate duplicate of that one (see the tool
-module's own docstring for why).
+Tests for the real read_report executor (core.tools.implementations.
+read_report_tool), including the path-sandboxing rules that keep it
+from ever reading anything outside its configured root directory.
+Mirrors tests/tools/implementations/test_read_research_findings_tool.py's
+structure closely -- this tool's sandboxing logic is a deliberate
+duplicate of that one (see the tool module's own docstring for why).
 """
 from __future__ import annotations
 
@@ -18,10 +17,10 @@ import pytest
 
 from core.security.engine.security_decision import SecurityDecisionPoint
 from core.tools.engine.tool_gateway import ToolGateway
-from core.tools.implementations.read_research_findings_tool import (
-    READ_RESEARCH_FINDINGS_TOOL,
-    READ_RESEARCH_FINDINGS_TOOL_ID,
-    create_read_research_findings_executor,
+from core.tools.implementations.read_report_tool import (
+    READ_REPORT_TOOL,
+    READ_REPORT_TOOL_ID,
+    create_read_report_executor,
 )
 from core.tools.registry.tool_registry import ToolRegistry
 
@@ -39,7 +38,7 @@ class _TempWorkspace:
 
     def __init__(self):
         self.parent = tempfile.mkdtemp()
-        self.root = os.path.join(self.parent, "findings_root")
+        self.root = os.path.join(self.parent, "reports_root")
         self.outside = os.path.join(self.parent, "outside_root")
         os.makedirs(self.root)
         os.makedirs(self.outside)
@@ -52,14 +51,14 @@ class _TempWorkspace:
 # ToolDefinition contract
 # ---------------------------------------------------------------------
 
-def test_read_research_findings_tool_definition_registers_cleanly():
+def test_read_report_tool_definition_registers_cleanly():
     registry = ToolRegistry()
-    registry.register(READ_RESEARCH_FINDINGS_TOOL)
+    registry.register(READ_REPORT_TOOL)
 
-    assert registry.contains(READ_RESEARCH_FINDINGS_TOOL_ID)
+    assert registry.contains(READ_REPORT_TOOL_ID)
 
-    tool = registry.get(READ_RESEARCH_FINDINGS_TOOL_ID)
-    assert tool.resource == "research_findings"
+    tool = registry.get(READ_REPORT_TOOL_ID)
+    assert tool.resource == "report"
     assert tool.action == "read"
     assert tool.scope == "workspace"
     assert tool.risk_level == "LOW"
@@ -71,7 +70,7 @@ def test_read_research_findings_tool_definition_registers_cleanly():
 
 def test_create_executor_raises_when_root_missing():
     with pytest.raises(ValueError, match="does not exist"):
-        create_read_research_findings_executor(
+        create_read_report_executor(
             "/no/such/directory/anywhere"
         )
 
@@ -83,7 +82,7 @@ def test_create_executor_raises_when_root_is_a_file():
         Path(file_path).write_text("x", encoding="utf-8")
 
         with pytest.raises(ValueError, match="not a directory"):
-            create_read_research_findings_executor(file_path)
+            create_read_report_executor(file_path)
     finally:
         workspace.cleanup()
 
@@ -92,21 +91,30 @@ def test_create_executor_raises_when_root_is_a_file():
 # Normal reads
 # ---------------------------------------------------------------------
 
-def test_executor_reads_an_existing_finding():
+def test_executor_reads_an_existing_report():
+    """
+    Content deliberately spans multiple lines. The fixture is written
+    with write_bytes() (raw UTF-8 bytes, "\\n" literally) rather than
+    write_text() specifically so this test is platform-independent:
+    write_text()'s default universal-newline translation would
+    silently write "\\r\\n" on Windows, which -- before this same
+    Build Phase 11 delivery cycle's Windows CRLF fix (see
+    read_report_tool.py's own docstring) -- made this exact assertion
+    fail on a real Windows pytest run (size_bytes/content mismatch).
+    """
     workspace = _TempWorkspace()
     try:
-        Path(workspace.root, "finding.md").write_text(
-            "The sky is blue.",
-            encoding="utf-8",
+        Path(workspace.root, "report.md").write_bytes(
+            "# Report\n\nThe sky is blue.".encode("utf-8")
         )
 
-        executor = create_read_research_findings_executor(workspace.root)
-        result = executor(filename="finding.md")
+        executor = create_read_report_executor(workspace.root)
+        result = executor(filename="report.md")
 
-        assert result["filename"] == "finding.md"
-        assert result["content"] == "The sky is blue."
+        assert result["filename"] == "report.md"
+        assert result["content"] == "# Report\n\nThe sky is blue."
         assert result["size_bytes"] == len(
-            "The sky is blue.".encode("utf-8")
+            "# Report\n\nThe sky is blue.".encode("utf-8")
         )
     finally:
         workspace.cleanup()
@@ -114,26 +122,18 @@ def test_executor_reads_an_existing_finding():
 
 def test_executor_reads_crlf_content_byte_exact_no_platform_translation():
     """
-    Windows CRLF fix (Build Phase 11 delivery cycle, caught by a real
-    pytest -v run on the user's Windows machine): before this fix,
-    reading via the platform default silently translated on-disk
-    "\\r\\n" to "\\n", which would make the returned `content`
-    shorter, in bytes, than `size_bytes` (computed from the real
-    on-disk `stat()` size just above it). The fixture here writes
-    literal "\\r\\n" bytes directly (not through write_text(), whose
-    behavior is itself platform-dependent) so this test is
-    deterministic on every platform, not just Windows -- it proves
-    the executor now preserves on-disk bytes exactly rather than
-    translating them, keeping `content` and `size_bytes` consistent
-    with each other and with what is actually on disk.
+    Windows CRLF fix (Build Phase 11 delivery cycle): mirrors
+    test_read_research_findings_tool.py's own equivalent test -- see
+    its docstring for the full explanation. Deterministic on every
+    platform since the fixture writes literal "\\r\\n" bytes directly.
     """
     workspace = _TempWorkspace()
     try:
         raw = b"Line one.\r\n\r\nLine two."
-        Path(workspace.root, "finding.md").write_bytes(raw)
+        Path(workspace.root, "report.md").write_bytes(raw)
 
-        executor = create_read_research_findings_executor(workspace.root)
-        result = executor(filename="finding.md")
+        executor = create_read_report_executor(workspace.root)
+        result = executor(filename="report.md")
 
         assert result["content"] == raw.decode("utf-8")
         assert result["size_bytes"] == len(raw)
@@ -147,13 +147,13 @@ def test_executor_reads_from_a_subdirectory_of_root():
     try:
         subdir = os.path.join(workspace.root, "sub")
         os.makedirs(subdir)
-        Path(subdir, "finding.md").write_text(
+        Path(subdir, "report.md").write_text(
             "# Heading",
             encoding="utf-8",
         )
 
-        executor = create_read_research_findings_executor(workspace.root)
-        result = executor(filename="sub/finding.md")
+        executor = create_read_report_executor(workspace.root)
+        result = executor(filename="sub/report.md")
 
         assert result["content"] == "# Heading"
     finally:
@@ -170,7 +170,7 @@ def test_executor_rejects_absolute_filename():
         secret = os.path.join(workspace.outside, "secret.md")
         Path(secret).write_text("outside content", encoding="utf-8")
 
-        executor = create_read_research_findings_executor(workspace.root)
+        executor = create_read_report_executor(workspace.root)
 
         with pytest.raises(PermissionError, match="absolute paths"):
             executor(filename=secret)
@@ -186,7 +186,7 @@ def test_executor_rejects_relative_traversal_escaping_root():
             encoding="utf-8",
         )
 
-        executor = create_read_research_findings_executor(workspace.root)
+        executor = create_read_report_executor(workspace.root)
 
         with pytest.raises(PermissionError, match="outside the approved"):
             executor(filename="../outside_root/secret.md")
@@ -197,7 +197,7 @@ def test_executor_rejects_relative_traversal_escaping_root():
 def test_executor_rejects_missing_file():
     workspace = _TempWorkspace()
     try:
-        executor = create_read_research_findings_executor(workspace.root)
+        executor = create_read_report_executor(workspace.root)
 
         with pytest.raises(FileNotFoundError):
             executor(filename="does_not_exist.md")
@@ -210,7 +210,7 @@ def test_executor_rejects_directory_path():
     try:
         os.makedirs(os.path.join(workspace.root, "a_directory.md"))
 
-        executor = create_read_research_findings_executor(workspace.root)
+        executor = create_read_report_executor(workspace.root)
 
         with pytest.raises(IsADirectoryError):
             executor(filename="a_directory.md")
@@ -223,7 +223,7 @@ def test_executor_rejects_disallowed_extension():
     try:
         Path(workspace.root, "script.exe").write_bytes(b"binary")
 
-        executor = create_read_research_findings_executor(workspace.root)
+        executor = create_read_report_executor(workspace.root)
 
         with pytest.raises(ValueError, match="not approved"):
             executor(filename="script.exe")
@@ -239,7 +239,7 @@ def test_executor_rejects_oversized_file():
             encoding="utf-8",
         )
 
-        executor = create_read_research_findings_executor(
+        executor = create_read_report_executor(
             workspace.root,
             max_bytes=10,
         )
@@ -257,7 +257,7 @@ def test_executor_rejects_non_utf8_content():
             b"\xff\xfe not valid utf-8"
         )
 
-        executor = create_read_research_findings_executor(workspace.root)
+        executor = create_read_report_executor(workspace.root)
 
         with pytest.raises(ValueError, match="not valid UTF-8"):
             executor(filename="bad_encoding.md")
@@ -268,7 +268,7 @@ def test_executor_rejects_non_utf8_content():
 def test_executor_rejects_empty_filename():
     workspace = _TempWorkspace()
     try:
-        executor = create_read_research_findings_executor(workspace.root)
+        executor = create_read_report_executor(workspace.root)
 
         with pytest.raises(ValueError, match="non-empty string"):
             executor(filename="   ")
@@ -284,13 +284,13 @@ def test_full_gateway_execution_succeeds_without_approval():
     workspace = _TempWorkspace()
     audit_dir = tempfile.mkdtemp()
     try:
-        Path(workspace.root, "finding.md").write_text(
-            "Evidence goes here.",
+        Path(workspace.root, "report.md").write_text(
+            "Report content goes here.",
             encoding="utf-8",
         )
 
         registry = ToolRegistry()
-        registry.register(READ_RESEARCH_FINDINGS_TOOL)
+        registry.register(READ_REPORT_TOOL)
 
         security = SecurityDecisionPoint(
             PERMISSIONS_FILE,
@@ -300,77 +300,26 @@ def test_full_gateway_execution_succeeds_without_approval():
         gateway = ToolGateway(security=security, registry=registry)
 
         gateway.register_executor(
-            tool_id=READ_RESEARCH_FINDINGS_TOOL_ID,
-            executor=create_read_research_findings_executor(
-                workspace.root
-            ),
-        )
-
-        result = gateway.execute(
-            subject="writer_agent",
-            tool_id=READ_RESEARCH_FINDINGS_TOOL_ID,
-            tool_kwargs={"filename": "finding.md"},
-        )
-
-        assert result.status == "SUCCESS"
-        assert result.security_decision.decision.value == "ALLOW"
-        assert result.subject == "writer_agent"
-        assert result.tool_id == READ_RESEARCH_FINDINGS_TOOL_ID
-        assert result.action == "read"
-
-        (artifact,) = result.artifacts
-        assert artifact["content"] == "Evidence goes here."
-    finally:
-        workspace.cleanup()
-        shutil.rmtree(audit_dir)
-
-
-def test_full_gateway_execution_succeeds_for_reviewer_agent_too():
-    """
-    Build Phase 11: reviewer_agent independently verifies a published
-    report against the same findings writer_agent reads -- this
-    ToolDefinition's `permissions` tuple now names both subjects
-    explicitly (see the tool module's own docstring), and
-    permissions.json separately grants reviewer_agent its own real
-    authorization entry. Proves the second, explicit grant actually
-    works end to end, not just that it parses.
-    """
-    workspace = _TempWorkspace()
-    audit_dir = tempfile.mkdtemp()
-    try:
-        Path(workspace.root, "finding.md").write_text(
-            "Evidence goes here.",
-            encoding="utf-8",
-        )
-
-        registry = ToolRegistry()
-        registry.register(READ_RESEARCH_FINDINGS_TOOL)
-
-        security = SecurityDecisionPoint(
-            PERMISSIONS_FILE,
-            audit_log_path=os.path.join(audit_dir, "audit.jsonl"),
-        )
-
-        gateway = ToolGateway(security=security, registry=registry)
-
-        gateway.register_executor(
-            tool_id=READ_RESEARCH_FINDINGS_TOOL_ID,
-            executor=create_read_research_findings_executor(
+            tool_id=READ_REPORT_TOOL_ID,
+            executor=create_read_report_executor(
                 workspace.root
             ),
         )
 
         result = gateway.execute(
             subject="reviewer_agent",
-            tool_id=READ_RESEARCH_FINDINGS_TOOL_ID,
-            tool_kwargs={"filename": "finding.md"},
+            tool_id=READ_REPORT_TOOL_ID,
+            tool_kwargs={"filename": "report.md"},
         )
 
         assert result.status == "SUCCESS"
+        assert result.security_decision.decision.value == "ALLOW"
         assert result.subject == "reviewer_agent"
+        assert result.tool_id == READ_REPORT_TOOL_ID
+        assert result.action == "read"
 
         (artifact,) = result.artifacts
-        assert artifact["content"] == "Evidence goes here."
+        assert artifact["content"] == "Report content goes here."
     finally:
         workspace.cleanup()
         shutil.rmtree(audit_dir)
@@ -378,20 +327,21 @@ def test_full_gateway_execution_succeeds_for_reviewer_agent_too():
 
 def test_full_gateway_execution_denies_a_subject_with_no_grant():
     """
-    research_agent has no permission for resource=research_findings/
-    action=read -- only writer_agent does. A distinct subject never
-    inherits another subject's permission implicitly.
+    writer_agent has no permission for resource=report/action=read --
+    only reviewer_agent does (writer_agent's own grant is
+    report:write, not report:read). A distinct subject never inherits
+    another subject's permission implicitly.
     """
     workspace = _TempWorkspace()
     audit_dir = tempfile.mkdtemp()
     try:
-        Path(workspace.root, "finding.md").write_text(
-            "Evidence goes here.",
+        Path(workspace.root, "report.md").write_text(
+            "Report content goes here.",
             encoding="utf-8",
         )
 
         registry = ToolRegistry()
-        registry.register(READ_RESEARCH_FINDINGS_TOOL)
+        registry.register(READ_REPORT_TOOL)
 
         security = SecurityDecisionPoint(
             PERMISSIONS_FILE,
@@ -401,16 +351,16 @@ def test_full_gateway_execution_denies_a_subject_with_no_grant():
         gateway = ToolGateway(security=security, registry=registry)
 
         gateway.register_executor(
-            tool_id=READ_RESEARCH_FINDINGS_TOOL_ID,
-            executor=create_read_research_findings_executor(
+            tool_id=READ_REPORT_TOOL_ID,
+            executor=create_read_report_executor(
                 workspace.root
             ),
         )
 
         result = gateway.execute(
-            subject="research_agent",
-            tool_id=READ_RESEARCH_FINDINGS_TOOL_ID,
-            tool_kwargs={"filename": "finding.md"},
+            subject="writer_agent",
+            tool_id=READ_REPORT_TOOL_ID,
+            tool_kwargs={"filename": "report.md"},
         )
 
         assert result.status == "DENIED"
@@ -429,7 +379,7 @@ def test_full_gateway_execution_surfaces_sandbox_escape_as_tool_error():
         )
 
         registry = ToolRegistry()
-        registry.register(READ_RESEARCH_FINDINGS_TOOL)
+        registry.register(READ_REPORT_TOOL)
 
         security = SecurityDecisionPoint(
             PERMISSIONS_FILE,
@@ -439,15 +389,15 @@ def test_full_gateway_execution_surfaces_sandbox_escape_as_tool_error():
         gateway = ToolGateway(security=security, registry=registry)
 
         gateway.register_executor(
-            tool_id=READ_RESEARCH_FINDINGS_TOOL_ID,
-            executor=create_read_research_findings_executor(
+            tool_id=READ_REPORT_TOOL_ID,
+            executor=create_read_report_executor(
                 workspace.root
             ),
         )
 
         result = gateway.execute(
-            subject="writer_agent",
-            tool_id=READ_RESEARCH_FINDINGS_TOOL_ID,
+            subject="reviewer_agent",
+            tool_id=READ_REPORT_TOOL_ID,
             tool_kwargs={"filename": "../outside_root/secret.md"},
         )
 
