@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -146,6 +147,21 @@ _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 def _looks_like_a_secret(content: str) -> bool:
     return any(pattern.search(content) for pattern in _SECRET_PATTERNS)
+
+
+# Module-level, not per-instance (Build Phase 21): two different
+# MemoryStore objects can both point at the same `store_path` (e.g.
+# research_agent's own build_research() factory in
+# core/kernel/default_kernel.py builds a fresh MemoryStore for every
+# Kernel.run() attempt, all sharing the same `memory_store_path`), so
+# a per-instance `threading.Lock` would not actually serialize two
+# concurrent writers targeting the same underlying file. Guards only
+# `_append` -- the one operation that can interleave two writers'
+# bytes into a corrupted line -- not `_read_all`: a reader opening the
+# file mid-append sees a consistent snapshot of whatever bytes have
+# already been flushed (POSIX append semantics), never a torn read, so
+# there is nothing for a lock to protect there.
+_APPEND_LOCK = threading.Lock()
 
 
 _TOKEN_PATTERN = re.compile(r"\w+")
@@ -338,8 +354,15 @@ class MemoryStore:
     # -- internals -------------------------------------------------
 
     def _append(self, record: MemoryRecord) -> None:
-        with self.store_path.open("a", encoding="utf-8") as file:
-            file.write(json.dumps(record.to_dict(), ensure_ascii=False) + "\n")
+        # Build Phase 21: serialized via the module-level _APPEND_LOCK
+        # (see its own docstring above) so two threads -- possibly
+        # each holding a different MemoryStore instance over the same
+        # `store_path`, as ConcurrentKernelRunner now makes possible --
+        # can never interleave their two writes into one corrupted
+        # line.
+        with _APPEND_LOCK:
+            with self.store_path.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(record.to_dict(), ensure_ascii=False) + "\n")
 
     def _read_all(self) -> tuple[MemoryRecord, ...]:
         if not self.store_path.exists():

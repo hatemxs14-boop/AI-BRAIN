@@ -4,6 +4,8 @@ ResponseCache, and CachingLLMClient.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from core.llm.caching_llm_client import (
@@ -327,3 +329,78 @@ def test_caching_llm_client_shares_a_cache_across_separate_instances():
     assert wrapped_a.call_count == 1
     assert wrapped_b.call_count == 0
     assert response_b.content == response_a.content == "from A"
+
+
+# ---------------------------------------------------------------------
+# Thread safety (Build Phase 21: core.kernel.concurrent_kernel is the
+# first caller that can reach a single shared ResponseCache from more
+# than one thread at once -- see that module's own top-of-file
+# docstring, and ResponseCache's own docstring for what changed here).
+# ---------------------------------------------------------------------
+
+
+def test_response_cache_survives_concurrent_puts_without_exceeding_max_entries():
+    cache = ResponseCache(max_entries=50)
+    thread_count = 32
+    puts_per_thread = 20
+
+    def _hammer(thread_index: int) -> None:
+        for i in range(puts_per_thread):
+            key = f"thread-{thread_index}-key-{i}"
+            cache.put(key, LLMResponse(content=key, model="m"))
+            # Interleave reads with writes -- a get() on a key that
+            # may or may not exist yet from another thread must never
+            # raise or corrupt state, only return a hit or a miss.
+            cache.get(key)
+
+    with ThreadPoolExecutor(max_workers=thread_count) as executor:
+        list(executor.map(_hammer, range(thread_count)))
+
+    # No exception escaped, and the hand-rolled LRU's own invariant
+    # (never more than max_entries live at once) held under real
+    # concurrent mutation, not just sequential use.
+    assert len(cache) <= 50
+
+
+def test_response_cache_concurrent_gets_never_raise_or_corrupt_order():
+    cache = ResponseCache(max_entries=10)
+
+    for i in range(10):
+        key = f"key-{i}"
+        cache.put(key, LLMResponse(content=key, model="m"))
+
+    def _read_all(_: int) -> int:
+        hits = 0
+        for i in range(10):
+            if cache.get(f"key-{i}") is not None:
+                hits += 1
+        return hits
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        results = list(executor.map(_read_all, range(64)))
+
+    # Every one of the 10 keys was present before any thread started
+    # reading, and nothing ever evicts on a pure get() -- every
+    # concurrent reader must see all 10 hits, every time.
+    assert all(hit_count == 10 for hit_count in results)
+    assert len(cache) == 10
+
+
+def test_caching_llm_client_under_concurrent_load_hits_the_shared_cache():
+    shared_cache = ResponseCache()
+    wrapped = _CountingLLMClient(LLMResponse(content="shared", model="m"))
+    client = CachingLLMClient(wrapped, cache=shared_cache)
+
+    def _call(_: int) -> str:
+        return client.generate(_request(temperature=0, content="same prompt")).content
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        results = list(executor.map(_call, range(64)))
+
+    assert all(result == "shared" for result in results)
+    # The real wrapped client may be called more than once if several
+    # threads all miss before the first write lands (an accepted,
+    # documented cache-aside race -- see CachingLLMClient's own
+    # docstring), but it must never be called anywhere near 64 times:
+    # the cache is doing real work under real concurrent load.
+    assert wrapped.call_count < 64

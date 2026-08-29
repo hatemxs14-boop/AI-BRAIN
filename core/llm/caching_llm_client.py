@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from dataclasses import replace
 
 from core.llm.llm_client import (
@@ -87,10 +88,22 @@ class ResponseCache:
     hand-rolled LRU (an ordered list of keys -- no external caching
     library), and process-local (no cross-process or cross-machine
     sharing; a real multi-process deployment would need a shared
-    backend, deliberately not built here). Not thread-safe -- this
-    project has no concurrent/parallel request handling yet (still an
-    open cost-efficiency priority; see the project's own baseline
-    doc), so this has never needed to be.
+    backend, deliberately not built here).
+
+    Thread-safe as of Build Phase 21 (core/kernel/concurrent_kernel.py):
+    a single `threading.Lock` (stdlib, no new dependency) guards every
+    mutation of `_store`/`_order`, so multiple threads calling `get()`/
+    `put()` concurrently on the SAME ResponseCache instance -- exactly
+    what happens when `build_default_kernel(enable_response_cache=True)`
+    hands the one `shared_response_cache` it creates to every fresh
+    CachingLLMClient built for a concurrently-running Kernel.run() call
+    -- can never interleave into a corrupted `_store`/`_order` pair
+    (e.g. an eviction racing a concurrent read of the same key). Before
+    this phase this class was explicitly documented as NOT thread-safe,
+    honestly, because nothing in this project could yet call it from
+    more than one thread at a time; ConcurrentKernelRunner is the first
+    caller that can, so this needed to become real before that
+    capability could safely ship.
     """
 
     def __init__(
@@ -114,6 +127,9 @@ class ResponseCache:
         # in-memory, single-process cache in the first place, per this
         # class's own scope above).
         self._order: list[str] = []
+        # Guards every read/mutation of `_store`/`_order` together --
+        # see this class's own docstring, Build Phase 21.
+        self._lock = threading.Lock()
 
     def get(self, key: str) -> LLMResponse | None:
         """
@@ -121,13 +137,14 @@ class ResponseCache:
         miss. A hit refreshes `key` as most-recently-used.
         """
 
-        response = self._store.get(key)
+        with self._lock:
+            response = self._store.get(key)
 
-        if response is not None:
-            self._order.remove(key)
-            self._order.append(key)
+            if response is not None:
+                self._order.remove(key)
+                self._order.append(key)
 
-        return response
+            return response
 
     def put(self, key: str, response: LLMResponse) -> None:
         """
@@ -139,18 +156,20 @@ class ResponseCache:
         if not isinstance(response, LLMResponse):
             raise TypeError("response must be an LLMResponse.")
 
-        if key in self._store:
-            self._order.remove(key)
+        with self._lock:
+            if key in self._store:
+                self._order.remove(key)
 
-        elif len(self._store) >= self._max_entries:
-            oldest_key = self._order.pop(0)
-            del self._store[oldest_key]
+            elif len(self._store) >= self._max_entries:
+                oldest_key = self._order.pop(0)
+                del self._store[oldest_key]
 
-        self._store[key] = response
-        self._order.append(key)
+            self._store[key] = response
+            self._order.append(key)
 
     def __len__(self) -> int:
-        return len(self._store)
+        with self._lock:
+            return len(self._store)
 
 
 class CachingLLMClient(LLMClient):
@@ -196,8 +215,21 @@ class CachingLLMClient(LLMClient):
     token_usage than an otherwise-identical run that never did.
 
     `hits`/`misses` are plain, always-real running counts kept on this
-    one instance, for direct inspection. Not yet threaded any further
-    up the stack (e.g. onto KernelResult, the way `token_usage` is) --
+    one instance, for direct inspection -- deliberately NOT guarded by
+    a lock the way the underlying ResponseCache's own `_store`/`_order`
+    are (Build Phase 21): `build_default_kernel()`'s own wiring builds
+    a fresh CachingLLMClient per Kernel.run() attempt (only the
+    ResponseCache passed to it is actually shared across concurrent
+    runs -- see this module's `build_default_kernel`-facing usage in
+    core/kernel/default_kernel.py), so under that default wiring
+    `hits`/`misses` are never touched by more than one thread. A caller
+    who deliberately shares one CachingLLMClient instance across
+    concurrently-running decision engines takes on the (cosmetic-only:
+    a lost increment undercounts a diagnostic statistic, it never
+    corrupts a cached response) risk of an undercounted hit/miss total
+    under real contention -- a real fix would need its own lock, not
+    silently claimed here. Not yet threaded any further up the stack
+    (e.g. onto KernelResult, the way `token_usage` is) --
     real future work if a caller needs it, not silently claimed here.
 
     Deliberately NOT built here, per this project's own "narrow,

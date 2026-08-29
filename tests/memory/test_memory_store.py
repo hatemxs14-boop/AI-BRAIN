@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -378,5 +379,59 @@ def test_tags_round_trip():
 
         (found,) = store.search("apple")
         assert found.tags == ("fruit", "example")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------
+# Thread safety (Build Phase 21: core.kernel.concurrent_kernel is the
+# first caller that can have more than one thread writing into the
+# SAME underlying store_path at once -- e.g. two concurrently-running
+# research_agent instances built from the same `memory_store_path`, per
+# core/kernel/default_kernel.py's own build_research(). See _APPEND_
+# LOCK's own docstring in core/memory/memory_store.py for why this is
+# a module-level lock, not a per-instance one.)
+# ---------------------------------------------------------------------
+
+
+def test_concurrent_writes_from_separate_store_instances_never_corrupt_the_file():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        store_path = str(tmp_dir / "memory.jsonl")
+        thread_count = 16
+        writes_per_thread = 10
+
+        def _write_many(thread_index: int) -> None:
+            # A fresh MemoryStore per thread, all pointed at the exact
+            # same file -- exactly the shape build_research()'s own
+            # factory produces under ConcurrentKernelRunner.
+            store = MemoryStore(store_path)
+            for i in range(writes_per_thread):
+                store.write(
+                    MemoryEntry(
+                        subject=f"thread-{thread_index}",
+                        kind="note",
+                        content=f"entry {thread_index}-{i} some real content",
+                    )
+                )
+
+        with ThreadPoolExecutor(max_workers=thread_count) as executor:
+            list(executor.map(_write_many, range(thread_count)))
+
+        # Every single write must have landed as its own valid,
+        # parseable JSON line -- a lock failure here would show up as
+        # fewer than expected lines (one writer's bytes silently
+        # overwritten/interleaved into another's) or a line that
+        # fails to parse (two writers' bytes merged into one corrupt
+        # line).
+        raw_lines = Path(store_path).read_text(encoding="utf-8").splitlines()
+        assert len(raw_lines) == thread_count * writes_per_thread
+
+        reader = MemoryStore(store_path)
+        all_records = reader._read_all()
+        assert len(all_records) == thread_count * writes_per_thread
+        assert len({record.id for record in all_records}) == (
+            thread_count * writes_per_thread
+        )
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
