@@ -18,6 +18,13 @@ ecc/
 .env.*
 !.env.example
 
+# Model/provider config (core/llm/model_config.py, Build Phase 18):
+# this file never contains a real API key -- only the *name* of the
+# environment variable to read one from -- but it IS deployment-
+# specific (which model/provider a given real business project points
+# at), so it is not tracked; only the template is.
+config/model_config.json
+
 # Logs
 *.log
 

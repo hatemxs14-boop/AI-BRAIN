@@ -52,6 +52,11 @@ from core.llm.llm_client import (
     LLMClient,
 )
 
+from core.llm.model_config import (
+    build_llm_client_factory_from_config,
+    load_model_config,
+)
+
 from core.memory.memory_store import (
     MemoryStore,
 )
@@ -396,6 +401,7 @@ def build_default_kernel(
     enable_research_write_review_workflow: bool = False,
     enable_write_and_review_workflow: bool = False,
     workflow_config_dir: str | Path | None = None,
+    model_config_path: str | Path | None = None,
 ) -> Kernel:
     """
     Build a Kernel with research_agent, writer_agent, and
@@ -515,15 +521,57 @@ def build_default_kernel(
     this entirely -- no directory is read, no behavior changes, same
     "no existing caller's behavior changes unless they opt in" reason
     every other flag on this function already follows.
+
+    `model_config_path` (Build Phase 18, default None) opts into
+    building `llm_client_factory` automatically from a single, shared
+    core.llm.model_config.ModelConfig JSON file (see that module's own
+    docstring, and config/model_config.example.json for the template)
+    instead of the caller writing its own vendor-SDK-construction code.
+    Only consulted when the caller supplies NEITHER `llm_client_factory`
+    NOR `decision_engine_factory` -- an explicit factory of either kind
+    always wins, so this is purely an additional way to satisfy the
+    "exactly one of the two is required" rule below, never a way to
+    loosen or bypass it. When used, this file's own `model`/
+    `temperature`/`max_tokens` only fill in whichever of this function's
+    own `model`/`temperature`/`max_tokens` parameters were left at their
+    default of None -- an explicit `model=`/`temperature=`/`max_tokens=`
+    argument to this call always wins over the file. This is the
+    concrete mechanism behind the "switch every business project built
+    on this Kernel to a new model or provider by editing one shared
+    file, not by editing code in each project" requirement -- see
+    core/llm/model_config.py's own top-of-file docstring for exactly
+    what is and is not verified for real in this project's own sandbox
+    (the vendor SDKs themselves are not installed there). None (the
+    default) reads no file and changes no existing caller's behavior,
+    same reason every other flag on this function already follows.
     """
 
     if decision_engine_factory is None:
 
         if llm_client_factory is None:
-            raise ValueError(
-                "Either llm_client_factory or decision_engine_factory "
-                "must be provided."
-            )
+
+            if model_config_path is not None:
+                loaded_model_config = load_model_config(model_config_path)
+                llm_client_factory = build_llm_client_factory_from_config(
+                    loaded_model_config
+                )
+
+                if model is None:
+                    model = loaded_model_config.model
+
+                if temperature is None:
+                    temperature = loaded_model_config.temperature
+
+                if max_tokens is None:
+                    max_tokens = loaded_model_config.max_tokens
+
+            else:
+                raise ValueError(
+                    "Either llm_client_factory or decision_engine_factory "
+                    "must be provided (or model_config_path, to build "
+                    "llm_client_factory automatically from a shared "
+                    "model/provider config file)."
+                )
 
         if not callable(llm_client_factory):
             raise TypeError(
