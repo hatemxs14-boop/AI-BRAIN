@@ -29,6 +29,11 @@ from core.agents.decision_engine import (
     AgentDecisionEngine,
 )
 
+from core.agents.guardrails import (
+    GuardrailFinding,
+    OutputGuardrailEngine,
+)
+
 from core.llm.token_usage import (
     TokenUsage,
 )
@@ -65,6 +70,20 @@ class AgentLoopResult:
     context: AgentContext
 
     token_usage: TokenUsage | None = None
+
+    guardrail_findings: tuple[GuardrailFinding, ...] = ()
+    """
+    Every Build Phase 23 GuardrailFinding produced across the whole
+    run, in the order they were found -- empty whenever no
+    `guardrail_engine` was configured for this loop, exactly like
+    `token_usage` being `None` for a decision engine that doesn't
+    expose it. Populated even for a run that was never blocked (a
+    non-enforcing/flagging engine, or an enforcing engine that never
+    saw a HIGH-severity finding) -- this is a full, honest audit
+    trail, not just a record of the one finding (if any) that actually
+    stopped the run. See core/agents/guardrails.py's own module
+    docstring for what each finding does and does not claim.
+    """
 
 
 class AgentExecutionLoop:
@@ -111,6 +130,7 @@ class AgentExecutionLoop:
         checkpoint_store: CheckpointStore | None = None,
         checkpoint_id: str | None = None,
         resume_from: TaskCheckpoint | None = None,
+        guardrail_engine: OutputGuardrailEngine | None = None,
     ) -> None:
         """
         `checkpoint_store`/`checkpoint_id`/`resume_from` (Build Phase
@@ -122,6 +142,12 @@ class AgentExecutionLoop:
         from an empty one -- see `run()`'s own docstring for exactly
         how, and core/agents/checkpoint.py's own module docstring for
         the full design rationale and its honestly-scoped limitations.
+
+        `guardrail_engine` (Build Phase 23) is entirely optional and
+        independent of the checkpoint/resume parameters above -- see
+        `run()`'s own docstring for exactly where it is consulted, and
+        core/agents/guardrails.py's own module docstring for what it
+        checks and why it defaults to flagging rather than blocking.
         """
 
         if not isinstance(
@@ -210,6 +236,16 @@ class AgentExecutionLoop:
         self.checkpoint_id = checkpoint_id
         self.resume_from = resume_from
 
+        if guardrail_engine is not None and not isinstance(
+            guardrail_engine, OutputGuardrailEngine
+        ):
+            raise TypeError(
+                "guardrail_engine must be an OutputGuardrailEngine."
+            )
+
+        self.guardrail_engine = guardrail_engine
+        self._guardrail_findings: list[GuardrailFinding] = []
+
         self.context: AgentContext | None = None
 
     def run(
@@ -217,6 +253,20 @@ class AgentExecutionLoop:
     ) -> AgentLoopResult:
         """
         Run the Agent execution loop.
+
+        Build Phase 23: when `self.guardrail_engine` is configured, it
+        is consulted once per step, right after the decided
+        AgentAction has already passed `self.action_validator` and
+        before that action is ever acted on (COMPLETE/FAIL executed,
+        or a tool invoked) -- see core/agents/guardrails.py's own
+        module docstring for exactly what it checks. Every finding is
+        recorded on this run's `AgentLoopResult.guardrail_findings`
+        regardless of outcome; only a HIGH-severity finding from an
+        engine configured with `enforce=True` stops the step, via a
+        new terminal status ("GUARDRAIL_BLOCKED") that mirrors
+        INVALID_ACTION's own shape: `self.agent.fail_task()` is called,
+        the step is never counted (this check runs before `steps` is
+        incremented), and the action is never executed.
         """
 
         task = getattr(
@@ -345,6 +395,36 @@ class AgentExecutionLoop:
                         f"action={action!r}"
                     ),
                 )
+
+            if self.guardrail_engine is not None:
+
+                verdict = self.guardrail_engine.evaluate(
+                    action=action,
+                    context=self.context,
+                )
+
+                self._guardrail_findings.extend(verdict.findings)
+
+                if verdict.blocked:
+
+                    self.agent.fail_task()
+
+                    blocking_findings = "; ".join(
+                        f"[{finding.severity}/{finding.rule}] "
+                        f"{finding.detail}"
+                        for finding in verdict.findings
+                        if finding.severity == "HIGH"
+                    )
+
+                    return self._build_result(
+                        status="GUARDRAIL_BLOCKED",
+                        steps=steps,
+                        last_result=last_result,
+                        reason=(
+                            "Blocked by output guardrails before "
+                            f"execution: {blocking_findings}"
+                        ),
+                    )
 
             steps += 1
 
@@ -590,6 +670,7 @@ class AgentExecutionLoop:
                 "total_usage",
                 None,
             ),
+            guardrail_findings=tuple(self._guardrail_findings),
         )
 
     def _apply_resume(

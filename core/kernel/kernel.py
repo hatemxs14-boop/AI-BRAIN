@@ -21,6 +21,10 @@ from core.agents.decision_engine import (
     AgentDecisionEngine,
 )
 
+from core.agents.guardrails import (
+    OutputGuardrailEngine,
+)
+
 from core.llm.token_usage import (
     TokenUsage,
     combine_token_usage,
@@ -854,6 +858,28 @@ class Kernel:
     MemoryStore.search()'s own `limit`). Defaults to 5 -- enough to be
     useful without one task's retrieval becoming unbounded; only
     meaningful when `memory_store` is configured.
+
+    `guardrail_engine` (Build Phase 23) is an optional
+    core.agents.guardrails.OutputGuardrailEngine this Kernel threads
+    through to every AgentExecutionLoop it drives for the PRIMARY
+    task-executing agent -- both a fresh `run()`/`run_workflow()` step
+    attempt and a `resume()`d one (see _execute_once's own docstring
+    for why configuring this, like `checkpoint_store`, means bypassing
+    the pluggable OrchestrationEngine seam). Defaults to `None`, in
+    which case AgentExecutionLoop is built with no guardrail engine at
+    all and behaves exactly as it did before Build Phase 23 -- the
+    same opt-in, additive shape every optional Kernel component above
+    already established.
+
+    Deliberately, honestly narrower than "every agent this Kernel ever
+    runs": a triggered `_trigger_independent_verification` run (the
+    reviewer_agent case described above) still goes through
+    `self.orchestration_engine.run()` directly and is not guardrail-
+    checked. This mirrors `checkpoint_store`'s own identical, already-
+    accepted scope boundary (that call site is not threaded with a
+    checkpoint either) rather than introducing a new one -- widening
+    either concern to cover that secondary, optional run is future
+    work, not a silently-assumed part of this phase.
     """
 
     def __init__(
@@ -865,6 +891,7 @@ class Kernel:
         independent_verifier: WorkflowVerifierRegistration | None = None,
         memory_store: MemoryStore | None = None,
         context_retrieval_limit: int = 5,
+        guardrail_engine: OutputGuardrailEngine | None = None,
     ) -> None:
 
         if not isinstance(max_recovery_attempts, int):
@@ -919,6 +946,16 @@ class Kernel:
 
         self.memory_store = memory_store
         self.context_retrieval_limit = context_retrieval_limit
+
+        if guardrail_engine is not None and not isinstance(
+            guardrail_engine, OutputGuardrailEngine
+        ):
+            raise TypeError(
+                "guardrail_engine must be an OutputGuardrailEngine "
+                "or None."
+            )
+
+        self.guardrail_engine = guardrail_engine
 
     def register_agent(
         self,
@@ -1219,6 +1256,7 @@ class Kernel:
             resume_from=checkpoint,
             checkpoint_store=checkpoint_store,
             checkpoint_id=checkpoint.checkpoint_id,
+            guardrail_engine=self.guardrail_engine,
         )
 
         loop_result = loop.run()
@@ -1520,13 +1558,22 @@ class Kernel:
         resume -- see core/agents/checkpoint.py's own module docstring
         for the distinction between the two).
 
-        When `checkpoint_store` is given, this bypasses the pluggable
-        OrchestrationEngine seam and drives AgentExecutionLoop directly
-        instead -- the exact same call SequentialOrchestrationEngine.
-        run() itself makes internally -- so this attempt's progress can
-        be checkpointed. See checkpoint.py's module docstring for why
-        this deliberately does not (yet) flow through
-        LangGraphOrchestrationEngine.
+        When `checkpoint_store` is given, OR when this Kernel was
+        constructed with a `guardrail_engine` (Build Phase 23), this
+        bypasses the pluggable OrchestrationEngine seam and drives
+        AgentExecutionLoop directly instead -- the exact same call
+        SequentialOrchestrationEngine.run() itself makes internally --
+        so this attempt's progress can be checkpointed and/or its
+        decisions guardrail-checked. See checkpoint.py's and
+        guardrails.py's own module docstrings for why this
+        deliberately does not (yet) flow through
+        LangGraphOrchestrationEngine: threading either concern through
+        that engine too would require changing code this sandbox
+        cannot install or execute even once (no PyPI access), and
+        shipping an unverified change to it would break this project's
+        own "nothing is done until a real pytest run confirms it"
+        rule -- the same reasoning already applied at Build Phases 4,
+        18, 21, and 22 for this exact untestable file.
         """
 
         plan = self._plan(
@@ -1537,7 +1584,7 @@ class Kernel:
 
         plan.agent.start_task(normalized.text)
 
-        if checkpoint_store is not None:
+        if checkpoint_store is not None or self.guardrail_engine is not None:
 
             loop = AgentExecutionLoop(
                 agent=plan.agent,
@@ -1545,6 +1592,7 @@ class Kernel:
                 max_steps=plan.max_steps,
                 checkpoint_store=checkpoint_store,
                 checkpoint_id=checkpoint_id,
+                guardrail_engine=self.guardrail_engine,
             )
 
             return loop.run()
