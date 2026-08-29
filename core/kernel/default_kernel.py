@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Callable
 
@@ -40,7 +39,12 @@ from core.kernel.kernel import (
     WorkflowDefinition,
     WorkflowStep,
     WorkflowVerifierRegistration,
+    contains_keyword_phrase,
     extract_first_artifact_path,
+)
+
+from core.kernel.workflow_config import (
+    build_workflow_from_config,
 )
 
 from core.llm.llm_client import (
@@ -178,12 +182,17 @@ def _contains_keyword(text: str, keywords: tuple[str, ...]) -> bool:
     check. See this module's own docstring for why plain substring
     matching was wrong (it let research_agent's "find" keyword match
     inside "finding"/"findings").
+
+    Build Phase 16: this is now a thin wrapper around core.kernel.
+    kernel.contains_keyword_phrase, which promoted this exact
+    word-boundary convention to a shared, module-level helper so
+    core/kernel/workflow_config.py's config-driven workflows can reuse
+    it too. Kept here, under its original name, so every existing
+    call site and docstring reference in this module needs no further
+    change.
     """
 
-    return any(
-        re.search(r"\b" + re.escape(keyword) + r"\b", text)
-        for keyword in keywords
-    )
+    return contains_keyword_phrase(text, keywords)
 
 
 def _research_agent_handles(normalized: NormalizedTask) -> bool:
@@ -384,6 +393,7 @@ def build_default_kernel(
     enable_independent_verification: bool = False,
     enable_memory_retrieval: bool = False,
     enable_research_write_review_workflow: bool = False,
+    enable_write_and_review_workflow: bool = False,
 ) -> Kernel:
     """
     Build a Kernel with research_agent, writer_agent, and
@@ -478,6 +488,19 @@ def build_default_kernel(
     WorkflowDefinition's own docstring for why the two selection paths
     can never collide), but it is still additive surface area a caller
     must ask for explicitly.
+
+    `enable_write_and_review_workflow` (Build Phase 16, default False)
+    opts into a second concrete WorkflowDefinition, "write_and_review"
+    (writer_agent -> reviewer_agent, triggered by the task text
+    containing both "draft" and "review" as whole words) -- this one
+    built from a plain config dict via core.kernel.workflow_config.
+    build_workflow_from_config() rather than hand-written can_handle/
+    build_task functions, demonstrating that a new workflow can now be
+    added as data. Uses the exact same fresh `build_writer`/
+    `build_reviewer` factories as standalone registration above, so it
+    reads/writes the same `findings_root`/`reports_root` locations.
+    Defaults to False for the same reason every other `enable_*` flag
+    on this function does.
     """
 
     if decision_engine_factory is None:
@@ -623,6 +646,37 @@ def build_default_kernel(
                         build_task=_research_write_review_step_3_task,
                     ),
                 ),
+            )
+        )
+
+    if enable_write_and_review_workflow:
+        kernel.register_workflow(
+            build_workflow_from_config(
+                {
+                    "name": "write_and_review",
+                    "description": (
+                        "Chains writer_agent -> reviewer_agent "
+                        "end-to-end from one instruction -- Build "
+                        "Phase 16's config-driven counterpart to "
+                        "'research_write_review' above, for a task "
+                        "that already has enough context for "
+                        "writer_agent to draft directly (no prior "
+                        "research_agent step). See core/kernel/"
+                        "workflow_config.py's own docstring for the "
+                        "config-driven mechanism itself."
+                    ),
+                    "trigger_keywords_all": ("draft", "review"),
+                    "steps": (
+                        {
+                            "subject": "writer_agent",
+                            "task_template": "{original_task}",
+                        },
+                        {
+                            "subject": "reviewer_agent",
+                            "task_template": "Review {previous_artifact_path}.",
+                        },
+                    ),
+                }
             )
         )
 

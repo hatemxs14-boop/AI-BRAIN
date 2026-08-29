@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Sequence
 
 from core.agents.agent_core import (
     AgentCore,
@@ -476,6 +477,39 @@ class WorkflowVerifierRegistration:
                 "WorkflowVerifierRegistration.build_decision_engine "
                 "must be callable."
             )
+
+
+def contains_keyword_phrase(text: str, keywords: Sequence[str]) -> bool:
+    """
+    True if `text` contains any of `keywords` as a whole word/phrase --
+    `\\bkeyword\\b`, never a plain substring check.
+
+    Promoted (Build Phase 16) out of core/kernel/default_kernel.py's
+    own private `_contains_keyword`, which introduced this exact
+    word-boundary convention in Build Phase 8/11 after plain substring
+    matching produced two real misrouting bugs there (research_agent's
+    "find" keyword matching inside "finding"/"findings"; writer_agent's
+    "report" keyword colliding with reviewer_agent's own domain -- see
+    that module's own docstring for the full history). Pulled up to
+    this module -- the same "shared helper, not a second copy" move
+    Build Phase 15 already made for extract_first_artifact_path below
+    -- so core/kernel/workflow_config.py's config-driven `can_handle`
+    predicates (Build Phase 16) use the exact same matching convention
+    as every hand-written agent/workflow predicate in
+    core/kernel/default_kernel.py, rather than a second, potentially
+    drifting implementation. `default_kernel.py`'s own `_contains_
+    keyword` now simply delegates here.
+
+    `text` is matched as given -- callers are responsible for
+    lowercasing it first if that's the intended comparison (every
+    existing caller in this project normalizes to lowercase before
+    calling this function).
+    """
+
+    return any(
+        re.search(r"\b" + re.escape(keyword) + r"\b", text)
+        for keyword in keywords
+    )
 
 
 def extract_first_artifact_path(loop_result: AgentLoopResult) -> str | None:
