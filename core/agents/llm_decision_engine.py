@@ -25,6 +25,11 @@ from core.llm.llm_request import (
     LLMRequest,
 )
 
+from core.llm.token_usage import (
+    TokenUsage,
+    combine_token_usage,
+)
+
 from core.tools.engine.tool_gateway import (
     ToolExecutionResult,
 )
@@ -51,6 +56,19 @@ class LLMDecisionEngine(AgentDecisionEngine):
     - makes security decisions
     - grants permissions
     - bypasses AgentCore
+
+    `total_usage` (Build Phase 19) is a running TokenUsage sum of
+    every real `generate()` call this exact instance has made so far
+    -- `None` until the first call that reports usage. One
+    AgentExecutionLoop run can call `decide()` (and therefore
+    `generate()`) many times before COMPLETE/FAIL, so this is read by
+    AgentExecutionLoop right when it builds each AgentLoopResult (see
+    that class's own `_build_result`), via a plain `getattr(...,
+    "total_usage", None)` -- this class has no special relationship
+    with the loop; any decision engine that happens to expose this
+    same attribute is picked up the same way, and one (like
+    DeterministicDecisionEngine, or any test double) that doesn't is
+    simply reported as `None`, never an error.
     """
 
     def __init__(
@@ -74,6 +92,7 @@ class LLMDecisionEngine(AgentDecisionEngine):
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.total_usage: TokenUsage | None = None
 
     def decide(
         self,
@@ -103,6 +122,17 @@ class LLMDecisionEngine(AgentDecisionEngine):
             raise ValueError(
                 "LLM returned no response."
             )
+
+        # Accumulated before any further validation below (including
+        # the max_tokens-truncation check right after this) -- a
+        # truncated or otherwise-unusable response still really cost
+        # real tokens, and Build Phase 19's whole point is that this
+        # total must never silently omit a call just because that
+        # call's own content later turned out to be unusable.
+        self.total_usage = combine_token_usage(
+            self.total_usage,
+            getattr(response, "usage", None),
+        )
 
         # Both providers normalize their vendor-specific stop reason
         # into a shared vocabulary (see ClaudeProvider/OpenAIProvider

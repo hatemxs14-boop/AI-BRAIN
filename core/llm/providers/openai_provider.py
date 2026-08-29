@@ -3,6 +3,7 @@
 from core.llm.llm_client import LLMClient
 from core.llm.llm_request import LLMRequest
 from core.llm.llm_response import LLMResponse
+from core.llm.token_usage import TokenUsage
 
 
 class OpenAIProvider(LLMClient):
@@ -160,6 +161,9 @@ class OpenAIProvider(LLMClient):
                 getattr(choice, "finish_reason", None)
             ),
             raw=response,
+            usage=self._extract_usage(
+                getattr(response, "usage", None)
+            ),
         )
 
     @classmethod
@@ -171,3 +175,35 @@ class OpenAIProvider(LLMClient):
             return None
 
         return cls._FINISH_REASON_MAP.get(raw_finish_reason, "other")
+
+    @staticmethod
+    def _extract_usage(raw_usage) -> TokenUsage | None:
+        """
+        Build a TokenUsage from OpenAI's own `response.usage`
+        (`prompt_tokens`/`completion_tokens`/`total_tokens`, all
+        provided directly -- unlike Anthropic's, OpenAI's own response
+        already computes the total, so it is trusted here rather than
+        recomputed, in case a future usage shape (e.g. reasoning
+        tokens) makes prompt+completion not equal total).
+
+        `None` whenever any of the three fields is missing or isn't a
+        real int (a mock/test client with no `.usage` attribute at
+        all, or a different SDK shape) -- this never fabricates a
+        partial or zero usage.
+        """
+
+        prompt_tokens = getattr(raw_usage, "prompt_tokens", None)
+        completion_tokens = getattr(raw_usage, "completion_tokens", None)
+        total_tokens = getattr(raw_usage, "total_tokens", None)
+
+        if any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in (prompt_tokens, completion_tokens, total_tokens)
+        ):
+            return None
+
+        return TokenUsage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+        )

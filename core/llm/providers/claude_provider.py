@@ -3,6 +3,7 @@
 from core.llm.llm_client import LLMClient
 from core.llm.llm_request import LLMRequest
 from core.llm.llm_response import LLMResponse
+from core.llm.token_usage import TokenUsage
 
 
 class ClaudeProvider(LLMClient):
@@ -160,6 +161,9 @@ class ClaudeProvider(LLMClient):
                 getattr(response, "stop_reason", None)
             ),
             raw=response,
+            usage=self._extract_usage(
+                getattr(response, "usage", None)
+            ),
         )
 
     @classmethod
@@ -171,3 +175,33 @@ class ClaudeProvider(LLMClient):
             return None
 
         return cls._FINISH_REASON_MAP.get(raw_stop_reason, "other")
+
+    @staticmethod
+    def _extract_usage(raw_usage) -> TokenUsage | None:
+        """
+        Build a TokenUsage from Anthropic's own `response.usage`
+        (an `input_tokens`/`output_tokens` object -- no `total_tokens`
+        of its own, unlike OpenAI's, so it is computed here).
+
+        `None` whenever `raw_usage` is missing either field or either
+        field isn't a real int (a mock/test client with no `.usage`
+        attribute at all, or an older/different SDK shape) -- this
+        never fabricates a partial or zero usage.
+        """
+
+        input_tokens = getattr(raw_usage, "input_tokens", None)
+        output_tokens = getattr(raw_usage, "output_tokens", None)
+
+        if (
+            isinstance(input_tokens, bool)
+            or isinstance(output_tokens, bool)
+            or not isinstance(input_tokens, int)
+            or not isinstance(output_tokens, int)
+        ):
+            return None
+
+        return TokenUsage(
+            prompt_tokens=input_tokens,
+            completion_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+        )

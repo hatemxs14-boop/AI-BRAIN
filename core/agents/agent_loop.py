@@ -24,6 +24,10 @@ from core.agents.decision_engine import (
     AgentDecisionEngine,
 )
 
+from core.llm.token_usage import (
+    TokenUsage,
+)
+
 from core.tools.engine.tool_gateway import (
     ToolExecutionResult,
 )
@@ -33,6 +37,16 @@ from core.tools.engine.tool_gateway import (
 class AgentLoopResult:
     """
     Final result of an Agent execution loop.
+
+    `token_usage` (Build Phase 19) is the real, normalized token cost
+    of every LLM call this one loop run made (a single run can call
+    `decide()` more than once before COMPLETE/FAIL) -- see
+    AgentExecutionLoop._build_result's own docstring for exactly how
+    it is read, and TokenUsage's own docstring for what "real" means
+    here. `None` when the decision engine in use doesn't expose usage
+    at all (e.g. DeterministicDecisionEngine, a test double, or an
+    `action_provider`-driven loop with no decision engine) -- never a
+    fabricated zero.
     """
 
     status: str
@@ -44,6 +58,8 @@ class AgentLoopResult:
     reason: str | None
 
     context: AgentContext
+
+    token_usage: TokenUsage | None = None
 
 
 class AgentExecutionLoop:
@@ -197,7 +213,7 @@ class AgentExecutionLoop:
 
                 if self.action_provider is not None:
 
-                    return AgentLoopResult(
+                    return self._build_result(
                         status="INVALID_ACTION",
                         steps=steps,
                         last_result=last_result,
@@ -205,17 +221,15 @@ class AgentExecutionLoop:
                             "Action provider failed to produce "
                             f"a valid AgentAction: {exc}"
                         ),
-                        context=self.context,
                     )
 
-                return AgentLoopResult(
+                return self._build_result(
                     status="DECISION_ERROR",
                     steps=steps,
                     last_result=last_result,
                     reason=(
                         f"Decision engine failed: {exc}"
                     ),
-                    context=self.context,
                 )
 
             if not isinstance(
@@ -225,7 +239,7 @@ class AgentExecutionLoop:
 
                 self.agent.fail_task()
 
-                return AgentLoopResult(
+                return self._build_result(
                     status="INVALID_ACTION",
                     steps=steps,
                     last_result=last_result,
@@ -233,7 +247,6 @@ class AgentExecutionLoop:
                         "Decision engine did not return "
                         "an AgentAction."
                     ),
-                    context=self.context,
                 )
 
             try:
@@ -248,7 +261,7 @@ class AgentExecutionLoop:
 
                 self.agent.fail_task()
 
-                return AgentLoopResult(
+                return self._build_result(
                     status="INVALID_ACTION",
                     steps=steps,
                     last_result=last_result,
@@ -256,7 +269,6 @@ class AgentExecutionLoop:
                         "AgentActionValidator raised an "
                         f"exception: {exc}"
                     ),
-                    context=self.context,
                 )
 
             if not validation.valid:
@@ -269,7 +281,7 @@ class AgentExecutionLoop:
                     None,
                 )
 
-                return AgentLoopResult(
+                return self._build_result(
                     status="INVALID_ACTION",
                     steps=steps,
                     last_result=last_result,
@@ -278,7 +290,6 @@ class AgentExecutionLoop:
                         f"errors={validation_details!r}; "
                         f"action={action!r}"
                     ),
-                    context=self.context,
                 )
 
             steps += 1
@@ -300,7 +311,7 @@ class AgentExecutionLoop:
 
                     self.agent.fail_task()
 
-                    return AgentLoopResult(
+                    return self._build_result(
                         status="EXECUTION_ERROR",
                         steps=steps,
                         last_result=last_result,
@@ -308,15 +319,13 @@ class AgentExecutionLoop:
                             "Completion action failed: "
                             f"{exc}"
                         ),
-                        context=self.context,
                     )
 
-                return AgentLoopResult(
+                return self._build_result(
                     status="COMPLETED",
                     steps=steps,
                     last_result=last_result,
                     reason=action.reason,
-                    context=self.context,
                 )
 
             if (
@@ -334,7 +343,7 @@ class AgentExecutionLoop:
 
                     self.agent.fail_task()
 
-                    return AgentLoopResult(
+                    return self._build_result(
                         status="EXECUTION_ERROR",
                         steps=steps,
                         last_result=last_result,
@@ -342,15 +351,13 @@ class AgentExecutionLoop:
                             "Failure action failed: "
                             f"{exc}"
                         ),
-                        context=self.context,
                     )
 
-                return AgentLoopResult(
+                return self._build_result(
                     status="FAILED",
                     steps=steps,
                     last_result=last_result,
                     reason=action.reason,
-                    context=self.context,
                 )
 
             if (
@@ -370,7 +377,7 @@ class AgentExecutionLoop:
 
                     self.agent.fail_task()
 
-                    return AgentLoopResult(
+                    return self._build_result(
                         status="EXECUTION_ERROR",
                         steps=steps,
                         last_result=last_result,
@@ -378,7 +385,6 @@ class AgentExecutionLoop:
                             "Tool action execution failed: "
                             f"{exc}"
                         ),
-                        context=self.context,
                     )
 
                 if not isinstance(
@@ -388,7 +394,7 @@ class AgentExecutionLoop:
 
                     self.agent.fail_task()
 
-                    return AgentLoopResult(
+                    return self._build_result(
                         status="EXECUTION_ERROR",
                         steps=steps,
                         last_result=last_result,
@@ -396,7 +402,6 @@ class AgentExecutionLoop:
                             "AgentCore returned an invalid "
                             "tool execution result."
                         ),
-                        context=self.context,
                     )
 
                 last_result = execution_result
@@ -415,7 +420,7 @@ class AgentExecutionLoop:
 
                     self.agent.await_approval()
 
-                    return AgentLoopResult(
+                    return self._build_result(
                         status="APPROVAL_REQUIRED",
                         steps=steps,
                         last_result=last_result,
@@ -430,14 +435,13 @@ class AgentExecutionLoop:
                                 "additional approval."
                             )
                         ),
-                        context=self.context,
                     )
 
                 if result_status != "SUCCESS":
 
                     self.agent.fail_task()
 
-                    return AgentLoopResult(
+                    return self._build_result(
                         status="TOOL_ERROR",
                         steps=steps,
                         last_result=last_result,
@@ -449,26 +453,24 @@ class AgentExecutionLoop:
                             )
                             or "Tool execution failed."
                         ),
-                        context=self.context,
                     )
 
                 continue
 
             self.agent.fail_task()
 
-            return AgentLoopResult(
+            return self._build_result(
                 status="INVALID_ACTION",
                 steps=steps,
                 last_result=last_result,
                 reason=(
                     "Unsupported AgentActionType."
                 ),
-                context=self.context,
             )
 
         self.agent.fail_task()
 
-        return AgentLoopResult(
+        return self._build_result(
             status="MAX_STEPS_EXCEEDED",
             steps=steps,
             last_result=last_result,
@@ -476,7 +478,46 @@ class AgentExecutionLoop:
                 "Agent execution stopped because "
                 "max_steps was exceeded."
             ),
+        )
+
+    def _build_result(
+        self,
+        *,
+        status: str,
+        steps: int,
+        last_result: ToolExecutionResult | None,
+        reason: str | None,
+    ) -> AgentLoopResult:
+        """
+        Build an AgentLoopResult for one of `run()`'s many exit
+        points, filling in `context` and `token_usage` the same way
+        every single time (Build Phase 19; the same "funnel every
+        return point through one helper" pattern SecurityDecisionPoint.
+        record_execution_outcome()/ToolGateway._finalize() already
+        established for a return-point count problem, Build Phase 13).
+
+        `token_usage` is read from `self.decision_engine.total_usage`
+        via `getattr(..., None)` -- deliberately duck-typed, not an
+        AgentDecisionEngine interface requirement: LLMDecisionEngine
+        exposes it (see that class's own docstring), an
+        `action_provider`-driven loop has no decision engine at all
+        (`self.decision_engine is None`), and any other decision
+        engine (DeterministicDecisionEngine, a test double) simply
+        doesn't have the attribute -- both cases resolve to `None`
+        here, never an error.
+        """
+
+        return AgentLoopResult(
+            status=status,
+            steps=steps,
+            last_result=last_result,
+            reason=reason,
             context=self.context,
+            token_usage=getattr(
+                self.decision_engine,
+                "total_usage",
+                None,
+            ),
         )
 
     def _refresh_available_tools(

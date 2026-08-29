@@ -16,6 +16,11 @@ from core.agents.decision_engine import (
     AgentDecisionEngine,
 )
 
+from core.llm.token_usage import (
+    TokenUsage,
+    combine_token_usage,
+)
+
 from core.memory.memory_store import (
     MemoryRecord,
     MemoryStore,
@@ -374,6 +379,17 @@ class KernelResult:
     exactly what it is (inspectable-only, untrusted, never fed back
     into execution) and Kernel._retrieve_context's docstring for when
     it is real vs. `None`.
+
+    `token_usage` (Build Phase 19) is the real, normalized total token
+    cost of this ENTIRE `run()` call -- every RECOVER IF NEEDED retry
+    attempt (each one a full, fresh, separately-billed attempt per
+    `_execute_once`'s own docstring), plus a triggered
+    `independent_verification`'s own run, if one happened. `None` only
+    when nothing executed at all (`NO_AGENT_AVAILABLE`) or the
+    decision engine(s) involved don't expose usage -- never a
+    fabricated zero. Purely inspectable, exactly like
+    `policy_evaluation`/`independent_verification`/`retrieved_context`
+    -- it never changes `status` or any other field.
     """
 
     status: str
@@ -385,6 +401,7 @@ class KernelResult:
     policy_evaluation: ExternalActionEvaluation | None = None
     independent_verification: AgentLoopResult | None = None
     retrieved_context: RetrievedContext | None = None
+    token_usage: TokenUsage | None = None
 
 
 @dataclass(frozen=True)
@@ -686,11 +703,20 @@ class WorkflowDefinition:
 class WorkflowStepResult:
     """
     One completed (or halted-at) step of a Kernel.run_workflow() run.
+
+    `token_usage` (Build Phase 19) is this step's OWN total token
+    cost, across every RECOVER IF NEEDED retry attempt this one step
+    made (see run_workflow()'s own step loop) -- deliberately a
+    separate field from `loop_result.token_usage`, which only ever
+    reflects the single final attempt kept as `loop_result`. `None`
+    when nothing was billed or the decision engine doesn't expose
+    usage.
     """
 
     subject: str
     loop_result: AgentLoopResult
     verification: KernelVerification
+    token_usage: TokenUsage | None = None
 
 
 @dataclass(frozen=True)
@@ -739,12 +765,21 @@ class WorkflowRunResult:
     as Kernel.run() applies it to a standalone task; there is no
     additional whole-workflow-level retry -- deliberately deferred as
     future work, so this phase does not overstate what it does.
+
+    `token_usage` (Build Phase 19) is the real, normalized total token
+    cost of every step that actually ran (summed from each step's own
+    `WorkflowStepResult.token_usage`, which already includes that
+    step's own retries) -- including the halting step, since it was
+    billed too even though the workflow didn't complete. `None` only
+    when no step ran at all (`NO_WORKFLOW_AVAILABLE`) or none of the
+    decision engines involved exposed usage.
     """
 
     status: str
     workflow_name: str
     completed_steps: tuple[WorkflowStepResult, ...]
     reason: str | None
+    token_usage: TokenUsage | None = None
 
 
 class Kernel:
@@ -998,6 +1033,12 @@ class Kernel:
             max_steps=max_steps,
         )
 
+        # Every attempt is a full, fresh, separately-billed run
+        # (_execute_once's own docstring: "never a resume") -- so a
+        # retry's own token cost is accumulated here as it happens,
+        # not read off only the last attempt kept as `loop_result`.
+        token_usage = loop_result.token_usage
+
         while (
             recovery_attempts < self.max_recovery_attempts
             and self._should_recover(loop_result)
@@ -1010,6 +1051,11 @@ class Kernel:
                 max_steps=max_steps,
             )
 
+            token_usage = combine_token_usage(
+                token_usage,
+                loop_result.token_usage,
+            )
+
         verification = self._verify(loop_result)
 
         policy_evaluation = self._evaluate_policy(loop_result)
@@ -1018,6 +1064,19 @@ class Kernel:
             completed_subject=registration.subject,
             loop_result=loop_result,
             max_steps=max_steps,
+        )
+
+        # A triggered independent verification is a real, separate
+        # agent run with its own real cost -- folded into this same
+        # total rather than left invisible just because it was
+        # automatic.
+        token_usage = combine_token_usage(
+            token_usage,
+            (
+                independent_verification.token_usage
+                if independent_verification is not None
+                else None
+            ),
         )
 
         self._learn(loop_result, verification)
@@ -1034,6 +1093,7 @@ class Kernel:
             policy_evaluation=policy_evaluation,
             independent_verification=independent_verification,
             retrieved_context=retrieved_context,
+            token_usage=token_usage,
         )
 
     def run_workflow(
@@ -1118,6 +1178,16 @@ class Kernel:
         completed_steps: list[WorkflowStepResult] = []
         previous_result: AgentLoopResult | None = None
 
+        def _workflow_token_usage() -> TokenUsage | None:
+            # Recomputed fresh at every one of this method's return
+            # points below from whatever `completed_steps` holds so
+            # far -- including the halting step itself, since it was
+            # genuinely billed even though the workflow didn't
+            # complete. Build Phase 19.
+            return combine_token_usage(
+                *(step.token_usage for step in completed_steps)
+            )
+
         for step in workflow.steps:
 
             registration = self._find_registration(step.subject)
@@ -1141,6 +1211,7 @@ class Kernel:
                         f"Step {step.subject!r}'s build_task raised "
                         f"while building its task text: {exc}"
                     ),
+                    token_usage=_workflow_token_usage(),
                 )
 
             step_normalized = self._normalize(step_task_text)
@@ -1151,6 +1222,10 @@ class Kernel:
                 normalized=step_normalized,
                 max_steps=max_steps,
             )
+
+            # Same reasoning as Kernel.run()'s own accumulation above:
+            # each retry is a full, fresh, separately-billed attempt.
+            step_token_usage = loop_result.token_usage
 
             while (
                 recovery_attempts < self.max_recovery_attempts
@@ -1164,6 +1239,11 @@ class Kernel:
                     max_steps=max_steps,
                 )
 
+                step_token_usage = combine_token_usage(
+                    step_token_usage,
+                    loop_result.token_usage,
+                )
+
             verification = self._verify(loop_result)
 
             completed_steps.append(
@@ -1171,6 +1251,7 @@ class Kernel:
                     subject=step.subject,
                     loop_result=loop_result,
                     verification=verification,
+                    token_usage=step_token_usage,
                 )
             )
 
@@ -1183,6 +1264,7 @@ class Kernel:
                         f"Step {step.subject!r} is awaiting human "
                         "approval; the workflow has stopped here."
                     ),
+                    token_usage=_workflow_token_usage(),
                 )
 
             if loop_result.status != "COMPLETED":
@@ -1195,6 +1277,7 @@ class Kernel:
                         f"(status={loop_result.status!r}); the "
                         "workflow has stopped here."
                     ),
+                    token_usage=_workflow_token_usage(),
                 )
 
             if not verification.passed:
@@ -1206,6 +1289,7 @@ class Kernel:
                         f"Step {step.subject!r} completed but did not "
                         f"pass verification: {verification.reason}"
                     ),
+                    token_usage=_workflow_token_usage(),
                 )
 
             previous_result = loop_result
@@ -1215,6 +1299,7 @@ class Kernel:
             workflow_name=workflow.name,
             completed_steps=tuple(completed_steps),
             reason=None,
+            token_usage=_workflow_token_usage(),
         )
 
     def _select_workflow(

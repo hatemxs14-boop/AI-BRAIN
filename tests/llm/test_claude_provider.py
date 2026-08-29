@@ -6,13 +6,15 @@ from core.llm.llm_client import LLMClient
 from core.llm.llm_request import LLMMessage, LLMRequest
 from core.llm.llm_response import LLMResponse
 from core.llm.providers.claude_provider import ClaudeProvider
+from core.llm.token_usage import TokenUsage
 
 
 class MockMessages:
 
-    def __init__(self, response_text: str, owner):
+    def __init__(self, response_text: str, owner, usage=None):
         self.response_text = response_text
         self.owner = owner
+        self.usage = usage
 
     def create(self, **kwargs):
         self.owner.last_kwargs = kwargs
@@ -22,22 +24,25 @@ class MockMessages:
                 self.text = text
 
         class Response:
-            def __init__(self, text):
+            def __init__(self, text, usage):
                 self.content = [Content(text)]
                 self.model = "claude-test"
                 self.stop_reason = "end_turn"
+                if usage is not None:
+                    self.usage = usage
 
-        return Response(self.response_text)
+        return Response(self.response_text, self.usage)
 
 
 class MockAnthropicClient:
 
-    def __init__(self, response_text: str):
+    def __init__(self, response_text: str, usage=None):
         self.response_text = response_text
         self.last_kwargs = None
         self.messages = MockMessages(
             response_text,
             self,
+            usage,
         )
 
 
@@ -135,3 +140,80 @@ def test_claude_provider_rejects_invalid_request():
 
     with pytest.raises(TypeError):
         provider.generate("INVALID_REQUEST")
+
+
+def test_claude_provider_normalizes_usage_from_real_response_shape():
+    # Anthropic's own response.usage carries input_tokens/output_tokens
+    # (no total of its own) -- a plain object with just those two
+    # attributes, matching that real shape without needing the actual
+    # anthropic package installed.
+    class _AnthropicUsage:
+        def __init__(self, input_tokens, output_tokens):
+            self.input_tokens = input_tokens
+            self.output_tokens = output_tokens
+
+    client = MockAnthropicClient(
+        response_text="Hello from Claude.",
+        usage=_AnthropicUsage(input_tokens=12, output_tokens=7),
+    )
+
+    provider = ClaudeProvider(client=client)
+
+    request = LLMRequest(
+        messages=(
+            LLMMessage(role="user", content="Say hello."),
+        ),
+        model="claude-test",
+    )
+
+    response = provider.generate(request)
+
+    assert response.usage == TokenUsage(
+        prompt_tokens=12,
+        completion_tokens=7,
+        total_tokens=19,
+    )
+
+
+def test_claude_provider_usage_is_none_when_response_has_no_usage():
+    client = MockAnthropicClient(
+        response_text="Hello from Claude."
+    )
+
+    provider = ClaudeProvider(client=client)
+
+    request = LLMRequest(
+        messages=(
+            LLMMessage(role="user", content="Say hello."),
+        ),
+        model="claude-test",
+    )
+
+    response = provider.generate(request)
+
+    assert response.usage is None
+
+
+def test_claude_provider_usage_is_none_when_usage_shape_is_incomplete():
+    class _IncompleteUsage:
+        def __init__(self, input_tokens):
+            self.input_tokens = input_tokens
+            # output_tokens deliberately missing.
+
+    client = MockAnthropicClient(
+        response_text="Hello from Claude.",
+        usage=_IncompleteUsage(input_tokens=12),
+    )
+
+    provider = ClaudeProvider(client=client)
+
+    request = LLMRequest(
+        messages=(
+            LLMMessage(role="user", content="Say hello."),
+        ),
+        model="claude-test",
+    )
+
+    response = provider.generate(request)
+
+    assert response.usage is None

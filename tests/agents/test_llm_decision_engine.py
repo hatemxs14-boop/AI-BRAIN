@@ -27,14 +27,20 @@ from core.llm.llm_response import (
     LLMResponse,
 )
 
+from core.llm.token_usage import (
+    TokenUsage,
+)
+
 
 class MockLLMClient(LLMClient):
 
     def __init__(
         self,
         response: str,
+        usage: TokenUsage | None = None,
     ):
         self.response = response
+        self.usage = usage
         self.last_request: LLMRequest | None = None
 
     def generate(
@@ -48,6 +54,7 @@ class MockLLMClient(LLMClient):
             content=self.response,
             model="mock-model",
             finish_reason="stop",
+            usage=self.usage,
         )
 
 
@@ -396,3 +403,92 @@ def test_llm_decision_engine_includes_tool_results_in_context():
         "SEARCH RESULT"
         in request.messages[1].content
     )
+
+
+def test_llm_decision_engine_starts_with_no_total_usage():
+    client = MockLLMClient(
+        response=(
+            '{"action_type":"COMPLETE",'
+            '"tool_id":null,'
+            '"inputs":null,'
+            '"reason":"Done."}'
+        )
+    )
+
+    engine = LLMDecisionEngine(client)
+
+    assert engine.total_usage is None
+
+
+def test_llm_decision_engine_records_usage_from_a_single_call():
+    usage = TokenUsage(
+        prompt_tokens=10,
+        completion_tokens=5,
+        total_tokens=15,
+    )
+
+    client = MockLLMClient(
+        response=(
+            '{"action_type":"COMPLETE",'
+            '"tool_id":null,'
+            '"inputs":null,'
+            '"reason":"Done."}'
+        ),
+        usage=usage,
+    )
+
+    engine = LLMDecisionEngine(client)
+
+    engine.decide(AgentContext(task="Test task"))
+
+    assert engine.total_usage == usage
+
+
+def test_llm_decision_engine_accumulates_usage_across_multiple_calls():
+    # One AgentExecutionLoop run can call decide() (and therefore
+    # generate()) many times before COMPLETE/FAIL -- this is the exact
+    # behavior AgentExecutionLoop._build_result relies on to report
+    # one loop run's TOTAL cost, not just its last call's cost.
+    client = MockLLMClient(
+        response=(
+            '{"action_type":"COMPLETE",'
+            '"tool_id":null,'
+            '"inputs":null,'
+            '"reason":"Done."}'
+        ),
+        usage=TokenUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+    )
+
+    engine = LLMDecisionEngine(client)
+
+    engine.decide(AgentContext(task="First call"))
+
+    client.usage = TokenUsage(
+        prompt_tokens=20, completion_tokens=8, total_tokens=28
+    )
+
+    engine.decide(AgentContext(task="Second call"))
+
+    assert engine.total_usage == TokenUsage(
+        prompt_tokens=30,
+        completion_tokens=13,
+        total_tokens=43,
+    )
+
+
+def test_llm_decision_engine_usage_stays_none_when_provider_never_reports_it():
+    client = MockLLMClient(
+        response=(
+            '{"action_type":"COMPLETE",'
+            '"tool_id":null,'
+            '"inputs":null,'
+            '"reason":"Done."}'
+        )
+    )
+
+    engine = LLMDecisionEngine(client)
+
+    engine.decide(AgentContext(task="First call"))
+    engine.decide(AgentContext(task="Second call"))
+
+    assert engine.total_usage is None
