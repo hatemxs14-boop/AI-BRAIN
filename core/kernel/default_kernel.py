@@ -48,6 +48,11 @@ from core.kernel.workflow_config import (
     load_workflow_configs_from_directory,
 )
 
+from core.llm.caching_llm_client import (
+    CachingLLMClient,
+    ResponseCache,
+)
+
 from core.llm.llm_client import (
     LLMClient,
 )
@@ -402,6 +407,9 @@ def build_default_kernel(
     enable_write_and_review_workflow: bool = False,
     workflow_config_dir: str | Path | None = None,
     model_config_path: str | Path | None = None,
+    enable_response_cache: bool = False,
+    response_cache_max_entries: int = 256,
+    response_cache_nondeterministic: bool = False,
 ) -> Kernel:
     """
     Build a Kernel with research_agent, writer_agent, and
@@ -544,6 +552,38 @@ def build_default_kernel(
     (the vendor SDKs themselves are not installed there). None (the
     default) reads no file and changes no existing caller's behavior,
     same reason every other flag on this function already follows.
+
+    `enable_response_cache` (Build Phase 20, default False) opts into
+    wrapping the resolved `llm_client_factory` (whether explicitly
+    supplied or built from `model_config_path` above) in a
+    core.llm.caching_llm_client.CachingLLMClient, backed by ONE shared
+    ResponseCache created here and reused by every fresh client
+    `decision_engine_factory()` builds -- so a cache hit is possible
+    not just within a single Kernel.run() call's own RECOVER IF NEEDED
+    retries, but across every separate Kernel.run()/run_workflow() call
+    made against this same Kernel instance for as long as it lives.
+    Only applies when `decision_engine_factory` itself is NOT
+    explicitly supplied by the caller (there is no llm_client_factory
+    to wrap in that case) -- a caller that builds its own
+    decision_engine_factory can still use CachingLLMClient directly.
+    See that class's own docstring for exactly when a response is
+    cached (temperature == 0 by default; see
+    `response_cache_nondeterministic` below) and what a cache hit does
+    to `token_usage` (an explicit, honest zero, never the original
+    call's real cost replayed). Defaults to False so every existing
+    caller's behavior, cost, and test counts are completely unchanged
+    unless explicitly opted in, the same pattern every other `enable_*`
+    flag on this function already follows.
+
+    `response_cache_max_entries` (Build Phase 20, default 256) is
+    passed straight through to the ResponseCache this creates when
+    `enable_response_cache=True` -- ignored otherwise.
+
+    `response_cache_nondeterministic` (Build Phase 20, default False)
+    is passed straight through to CachingLLMClient's own
+    `cache_nondeterministic` -- ignored when `enable_response_cache`
+    is False. See CachingLLMClient's own docstring for what setting
+    this to True actually opts into and why it is never the default.
     """
 
     if decision_engine_factory is None:
@@ -577,6 +617,19 @@ def build_default_kernel(
             raise TypeError(
                 "llm_client_factory must be callable."
             )
+
+        if enable_response_cache:
+            base_llm_client_factory = llm_client_factory
+            shared_response_cache = ResponseCache(
+                max_entries=response_cache_max_entries
+            )
+
+            def llm_client_factory() -> LLMClient:
+                return CachingLLMClient(
+                    base_llm_client_factory(),
+                    cache=shared_response_cache,
+                    cache_nondeterministic=response_cache_nondeterministic,
+                )
 
         def decision_engine_factory() -> AgentDecisionEngine:
             return LLMDecisionEngine(
