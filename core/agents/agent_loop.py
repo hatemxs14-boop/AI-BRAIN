@@ -20,6 +20,11 @@ from core.agents.agent_core import (
     AgentCore,
 )
 
+from core.agents.checkpoint import (
+    CheckpointStore,
+    TaskCheckpoint,
+)
+
 from core.agents.decision_engine import (
     AgentDecisionEngine,
 )
@@ -103,7 +108,21 @@ class AgentExecutionLoop:
         ] | None = None,
         max_steps: int = 10,
         action_validator: AgentActionValidator | None = None,
+        checkpoint_store: CheckpointStore | None = None,
+        checkpoint_id: str | None = None,
+        resume_from: TaskCheckpoint | None = None,
     ) -> None:
+        """
+        `checkpoint_store`/`checkpoint_id`/`resume_from` (Build Phase
+        22) are entirely optional and independent of one another in
+        principle, but in practice: `checkpoint_id` is required
+        whenever `checkpoint_store` is given (there is no default
+        identity for a checkpoint), and `resume_from`, when given,
+        seeds this run's starting AgentContext instead of starting
+        from an empty one -- see `run()`'s own docstring for exactly
+        how, and core/agents/checkpoint.py's own module docstring for
+        the full design rationale and its honestly-scoped limitations.
+        """
 
         if not isinstance(
             agent,
@@ -165,6 +184,32 @@ class AgentExecutionLoop:
             else AgentActionValidator()
         )
 
+        if checkpoint_store is not None and not isinstance(
+            checkpoint_store, CheckpointStore
+        ):
+            raise TypeError(
+                "checkpoint_store must be a CheckpointStore."
+            )
+
+        if checkpoint_store is not None and (
+            not isinstance(checkpoint_id, str) or not checkpoint_id.strip()
+        ):
+            raise ValueError(
+                "checkpoint_id must be a non-empty string when "
+                "checkpoint_store is provided."
+            )
+
+        if resume_from is not None and not isinstance(
+            resume_from, TaskCheckpoint
+        ):
+            raise TypeError(
+                "resume_from must be a TaskCheckpoint."
+            )
+
+        self.checkpoint_store = checkpoint_store
+        self.checkpoint_id = checkpoint_id
+        self.resume_from = resume_from
+
         self.context: AgentContext | None = None
 
     def run(
@@ -193,10 +238,19 @@ class AgentExecutionLoop:
             task=task,
         )
 
+        if self.resume_from is not None:
+            self._apply_resume(task)
+
         self._refresh_available_tools()
 
-        steps = 0
+        steps = self.context.step_count
 
+        # A resumed run's `last_result` starts `None` even when real
+        # tool calls happened before the interruption this checkpoint
+        # is recovering from -- see core/agents/checkpoint.py's own
+        # module docstring for why this is a deliberate, documented
+        # limitation rather than a fabricated stand-in, and why it is
+        # not a new, unverified code path.
         last_result: ToolExecutionResult | None = None
 
         while steps < self.max_steps:
@@ -455,6 +509,10 @@ class AgentExecutionLoop:
                         ),
                     )
 
+                self._save_checkpoint(
+                    steps=steps,
+                )
+
                 continue
 
             self.agent.fail_task()
@@ -505,7 +563,21 @@ class AgentExecutionLoop:
         engine (DeterministicDecisionEngine, a test double) simply
         doesn't have the attribute -- both cases resolve to `None`
         here, never an error.
+
+        Also deletes any Build Phase 22 checkpoint for this loop
+        (no-op when checkpointing isn't configured) -- every one of
+        `run()`'s exit points funnels through here, so this is the one
+        place that reliably knows the loop is about to stop, for
+        whatever reason. A checkpoint's only job is to survive an
+        interruption WHILE the loop is still running; once `run()`
+        actually returns (COMPLETED, FAILED, APPROVAL_REQUIRED, or any
+        other terminal status), that status itself is the record of
+        what happened -- see core/agents/checkpoint.py's own
+        FileCheckpointStore docstring for why a leftover checkpoint
+        file past this point would be stale, not helpful.
         """
+
+        self._delete_checkpoint()
 
         return AgentLoopResult(
             status=status,
@@ -519,6 +591,87 @@ class AgentExecutionLoop:
                 None,
             ),
         )
+
+    def _apply_resume(
+        self,
+        task: str,
+    ) -> None:
+        """
+        Seed `self.context` from `self.resume_from` (Build Phase 22)
+        before the execution loop starts, so it picks up exactly where
+        an earlier, interrupted run of the SAME task left off instead
+        of starting from an empty AgentContext.
+
+        Deliberately does not restore `available_tools`: the loop
+        already refreshes those fresh on every single iteration
+        (`_refresh_available_tools`), so trusting a possibly-stale
+        checkpoint copy instead would be strictly worse, never better.
+        """
+
+        checkpoint = self.resume_from
+
+        if checkpoint.task != task:
+            raise ValueError(
+                "resume_from.task does not match the task this loop "
+                "was started with; refusing to resume a checkpoint "
+                "for a different task."
+            )
+
+        if checkpoint.subject != self.agent.identity.subject:
+            raise ValueError(
+                "resume_from.subject does not match this loop's own "
+                "agent; refusing to resume a checkpoint captured for "
+                "a different agent."
+            )
+
+        self.context.step_count = checkpoint.step_count
+        self.context.tool_results = list(checkpoint.tool_results)
+
+    def _save_checkpoint(
+        self,
+        *,
+        steps: int,
+    ) -> None:
+        """
+        Persist a Build Phase 22 TaskCheckpoint after a step's tool
+        call has already succeeded -- no-op when `self.checkpoint_store`
+        isn't configured. Called only from the SUCCESS path of an
+        INVOKE_TOOL action, right before the loop continues to its
+        next iteration: that is exactly "already-completed, already-
+        billed work" worth protecting, and nothing more -- an
+        in-flight LLM call that hasn't returned yet has nothing to
+        checkpoint.
+        """
+
+        if self.checkpoint_store is None:
+            return
+
+        checkpoint = TaskCheckpoint.from_tool_results(
+            checkpoint_id=self.checkpoint_id,
+            subject=self.agent.identity.subject,
+            task=self.context.task,
+            step_count=steps,
+            tool_results=self.context.tool_results,
+            last_tool_id=self.agent.state.last_tool_id,
+        )
+
+        self.checkpoint_store.save(checkpoint)
+
+    def _delete_checkpoint(
+        self,
+    ) -> None:
+        """
+        Remove this loop's own Build Phase 22 checkpoint, if any --
+        no-op when checkpointing isn't configured, and safe to call
+        even when no checkpoint was ever actually saved (e.g. the loop
+        completed on its very first step, or `run()` raised before any
+        SUCCESS step occurred).
+        """
+
+        if self.checkpoint_store is None:
+            return
+
+        self.checkpoint_store.delete(self.checkpoint_id)
 
     def _refresh_available_tools(
         self,

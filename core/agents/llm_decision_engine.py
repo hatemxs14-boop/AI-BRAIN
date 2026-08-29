@@ -314,6 +314,37 @@ class LLMDecisionEngine(AgentDecisionEngine):
                 "artifacts": [],
             }
 
+        if isinstance(result, dict) and {
+            "status",
+            "summary",
+            "artifacts",
+        } <= result.keys():
+            # Already in the exact shape this method itself produces --
+            # e.g. a Build Phase 22 checkpoint-restored tool result
+            # (core/agents/checkpoint.py's TaskCheckpoint.tool_results),
+            # which persists only this LLM-visible projection of a real
+            # ToolExecutionResult, never a fabricated stand-in for the
+            # real object (that would need a fabricated SecurityDecision
+            # /RiskAssessment/AuthorizationResult/ApprovalDecision just
+            # to satisfy ToolExecutionResult's own required fields --
+            # exactly what this project's "never fabricate to look
+            # complete" rule forbids). Passed through unchanged rather
+            # than re-summarized as an "unrecognized shape" below, so a
+            # resumed run's prompt still honestly shows what already
+            # happened before the interruption.
+            artifacts = result["artifacts"]
+
+            if isinstance(artifacts, (tuple, list)):
+                safe_artifacts = [str(item) for item in artifacts]
+            else:
+                safe_artifacts = [str(artifacts)]
+
+            return {
+                "status": result["status"],
+                "summary": result["summary"],
+                "artifacts": safe_artifacts,
+            }
+
         if not isinstance(result, ToolExecutionResult):
             # Unrecognized result shape (e.g. a plain string or other
             # value recorded directly into AgentContext). Without this

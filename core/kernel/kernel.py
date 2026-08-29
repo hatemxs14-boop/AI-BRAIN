@@ -9,7 +9,12 @@ from core.agents.agent_core import (
 )
 
 from core.agents.agent_loop import (
+    AgentExecutionLoop,
     AgentLoopResult,
+)
+
+from core.agents.checkpoint import (
+    CheckpointStore,
 )
 
 from core.agents.decision_engine import (
@@ -997,11 +1002,33 @@ class Kernel:
         task: str,
         *,
         max_steps: int = 10,
+        checkpoint_store: CheckpointStore | None = None,
+        checkpoint_id: str | None = None,
     ) -> KernelResult:
         """
         Run the full Kernel lifecycle for one objective, from
         NORMALIZE through FINAL RESULT.
+
+        `checkpoint_store`/`checkpoint_id` (Build Phase 22) are
+        entirely optional -- when `checkpoint_store` is `None` (the
+        default), this call behaves exactly as it did before this
+        phase existed. When provided, progress is durably saved after
+        every successfully completed step, so a later process that
+        never got the chance to see this call return can pick the task
+        back up with `Kernel.resume()` instead of starting over -- see
+        core/agents/checkpoint.py's own module docstring for the full
+        design and its honestly-scoped limitations. `checkpoint_id`
+        identifies the checkpoint; it is the caller's responsibility to
+        keep it unique per logical task.
         """
+
+        if checkpoint_store is not None and (
+            not isinstance(checkpoint_id, str) or not checkpoint_id.strip()
+        ):
+            raise ValueError(
+                "checkpoint_id must be a non-empty string when "
+                "checkpoint_store is provided."
+            )
 
         normalized = self._normalize(task)
 
@@ -1031,12 +1058,18 @@ class Kernel:
             registration=registration,
             normalized=normalized,
             max_steps=max_steps,
+            checkpoint_store=checkpoint_store,
+            checkpoint_id=checkpoint_id,
         )
 
         # Every attempt is a full, fresh, separately-billed run
         # (_execute_once's own docstring: "never a resume") -- so a
         # retry's own token cost is accumulated here as it happens,
         # not read off only the last attempt kept as `loop_result`.
+        # A checkpoint carries across retries by `checkpoint_id`
+        # alone: each fresh attempt starts checkpointing from step 0
+        # again under the SAME id, so the file always reflects
+        # whichever attempt is currently running, never a stale one.
         token_usage = loop_result.token_usage
 
         while (
@@ -1049,6 +1082,8 @@ class Kernel:
                 registration=registration,
                 normalized=normalized,
                 max_steps=max_steps,
+                checkpoint_store=checkpoint_store,
+                checkpoint_id=checkpoint_id,
             )
 
             token_usage = combine_token_usage(
@@ -1090,6 +1125,134 @@ class Kernel:
             verification=verification,
             reason=loop_result.reason,
             recovery_attempts=recovery_attempts,
+            policy_evaluation=policy_evaluation,
+            independent_verification=independent_verification,
+            retrieved_context=retrieved_context,
+            token_usage=token_usage,
+        )
+
+    def resume(
+        self,
+        checkpoint_id: str,
+        *,
+        checkpoint_store: CheckpointStore,
+        max_steps: int = 10,
+    ) -> KernelResult:
+        """
+        Resume a Build Phase 22 checkpoint left behind by a
+        `Kernel.run()` call whose PROCESS stopped (crashed, was
+        killed, or the environment restarted) before that call could
+        return -- not a run that returned with a recoverable error
+        inside the same still-running process (that is RECOVER IF
+        NEEDED's job, `_should_recover`/`max_recovery_attempts`,
+        completely unaffected by this method).
+
+        Builds a fresh agent/decision-engine from the SAME
+        AgentRegistration the original run used (looked up by the
+        checkpoint's own `subject`), seeds the execution loop from the
+        checkpoint instead of an empty AgentContext, and runs it
+        through to a terminal AgentLoopResult exactly the way `run()`
+        does for its own single `_execute_once` attempt -- including
+        VERIFY, the policy evaluation, and a possible triggered
+        independent verification.
+
+        Deliberately narrower than `run()` in two documented ways: no
+        NORMALIZE/CLASSIFY/AGENT SELECTION (the checkpoint already
+        names the exact subject/task the original run resolved those
+        to), and no RECOVER IF NEEDED retry loop around the resumed
+        attempt itself -- if the resumed attempt comes back with a
+        recoverable status, this returns that result as-is rather than
+        silently re-attempting; a caller can call `resume()` again
+        (the checkpoint will simply reflect wherever that attempt got
+        to) or accept the terminal state. This is a real, honestly-
+        scoped v1 boundary, not a silently-claimed one -- see
+        core/agents/checkpoint.py's own module docstring for the rest
+        of this feature's scope.
+        """
+
+        if not isinstance(checkpoint_store, CheckpointStore):
+            raise TypeError(
+                "checkpoint_store must be a CheckpointStore."
+            )
+
+        checkpoint = checkpoint_store.load(checkpoint_id)
+
+        if checkpoint is None:
+            raise ValueError(
+                f"No checkpoint found for checkpoint_id={checkpoint_id!r}; "
+                "nothing to resume."
+            )
+
+        registration = None
+
+        for candidate in self._registrations:
+            if candidate.subject == checkpoint.subject:
+                registration = candidate
+                break
+
+        if registration is None:
+            raise ValueError(
+                f"No agent is registered for subject={checkpoint.subject!r}; "
+                "cannot resume this checkpoint against this Kernel."
+            )
+
+        normalized = self._normalize(checkpoint.task)
+
+        retrieved_context = self._retrieve_context(normalized)
+
+        agent = registration.build_agent()
+
+        if not isinstance(agent, AgentCore):
+            raise TypeError(
+                "AgentRegistration.build_agent() must return an "
+                "AgentCore."
+            )
+
+        decision_engine = registration.build_decision_engine()
+
+        agent.start_task(normalized.text)
+
+        loop = AgentExecutionLoop(
+            agent=agent,
+            decision_engine=decision_engine,
+            max_steps=max_steps,
+            resume_from=checkpoint,
+            checkpoint_store=checkpoint_store,
+            checkpoint_id=checkpoint.checkpoint_id,
+        )
+
+        loop_result = loop.run()
+
+        verification = self._verify(loop_result)
+
+        policy_evaluation = self._evaluate_policy(loop_result)
+
+        independent_verification = self._trigger_independent_verification(
+            completed_subject=registration.subject,
+            loop_result=loop_result,
+            max_steps=max_steps,
+        )
+
+        token_usage = combine_token_usage(
+            loop_result.token_usage,
+            (
+                independent_verification.token_usage
+                if independent_verification is not None
+                else None
+            ),
+        )
+
+        self._learn(loop_result, verification)
+
+        status = self._final_status(loop_result, verification)
+
+        return KernelResult(
+            status=status,
+            subject=registration.subject,
+            loop_result=loop_result,
+            verification=verification,
+            reason=loop_result.reason,
+            recovery_attempts=0,
             policy_evaluation=policy_evaluation,
             independent_verification=independent_verification,
             retrieved_context=retrieved_context,
@@ -1345,12 +1508,25 @@ class Kernel:
         registration: AgentRegistration,
         normalized: NormalizedTask,
         max_steps: int,
+        checkpoint_store: CheckpointStore | None = None,
+        checkpoint_id: str | None = None,
     ) -> AgentLoopResult:
         """
         Build a fresh PLAN from `registration` and run it once through
         the OrchestrationEngine. Used both for the initial attempt and
         for every RECOVER IF NEEDED retry -- always a full, fresh
-        attempt, never a resume.
+        attempt, never a resume (that per-process retry policy is
+        untouched by, and unrelated to, Build Phase 22's checkpoint/
+        resume -- see core/agents/checkpoint.py's own module docstring
+        for the distinction between the two).
+
+        When `checkpoint_store` is given, this bypasses the pluggable
+        OrchestrationEngine seam and drives AgentExecutionLoop directly
+        instead -- the exact same call SequentialOrchestrationEngine.
+        run() itself makes internally -- so this attempt's progress can
+        be checkpointed. See checkpoint.py's module docstring for why
+        this deliberately does not (yet) flow through
+        LangGraphOrchestrationEngine.
         """
 
         plan = self._plan(
@@ -1360,6 +1536,18 @@ class Kernel:
         )
 
         plan.agent.start_task(normalized.text)
+
+        if checkpoint_store is not None:
+
+            loop = AgentExecutionLoop(
+                agent=plan.agent,
+                decision_engine=plan.decision_engine,
+                max_steps=plan.max_steps,
+                checkpoint_store=checkpoint_store,
+                checkpoint_id=checkpoint_id,
+            )
+
+            return loop.run()
 
         return self.orchestration_engine.run(
             agent=plan.agent,
