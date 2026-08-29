@@ -10,7 +10,12 @@ tests/orchestration/test_langgraph_orchestration_engine.py:
    at all (WorkflowStage's own validation, MultiAgentWorkflowEngine's
    own stage-list validation, and the "raises a clear ImportError when
    langgraph is missing" test) -- these run for real in ANY
-   environment, this sandbox included.
+   environment, this sandbox included. The "missing langgraph" test
+   simulates the absence deterministically via
+   `monkeypatch.setitem(sys.modules, "langgraph", None)` rather than
+   depending on the host environment genuinely lacking the package --
+   see tests/orchestration/test_langgraph_orchestration_engine.py's own
+   docstring for why (the same fix applied there for the same reason).
 
 2. Real-integration tests that build and actually run a compiled
    graph -- skip-guarded with `pytest.importorskip("langgraph")`, so
@@ -29,6 +34,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
@@ -257,16 +263,30 @@ def test_engine_rejects_duplicate_stage_names(tmp_dir):
         MultiAgentWorkflowEngine([stage_a, stage_b])
 
 
-def test_engine_raises_clear_import_error_when_langgraph_missing(tmp_dir):
-    try:
-        import langgraph  # noqa: F401
-    except ImportError:
-        pass
-    else:
-        pytest.skip(
-            "langgraph is installed in this environment; the missing-"
-            "dependency path this test checks doesn't apply here."
-        )
+# Every exact dotted name MultiAgentWorkflowEngine.__init__ imports.
+# Blanking only "langgraph" itself is NOT sufficient once a not-yet-
+# cached submodule (e.g. "langgraph.checkpoint.memory") needs to be
+# resolved through an already-None-valued parent -- confirmed as a
+# real machine failure (AttributeError: 'NoneType' object has no
+# attribute '__path__') the first time this test used only
+# `sys.modules["langgraph"] = None`. See
+# tests/orchestration/test_langgraph_orchestration_engine.py's own
+# comment on the same technique for the full explanation. Blanking
+# every literal dotted name actually imported, regardless of whether
+# it happens to be cached already, sidesteps the issue entirely.
+_LANGGRAPH_IMPORT_PATHS = (
+    "langgraph",
+    "langgraph.graph",
+    "langgraph.checkpoint",
+    "langgraph.checkpoint.memory",
+)
+
+
+def test_engine_raises_clear_import_error_when_langgraph_missing(
+    tmp_dir, monkeypatch
+):
+    for name in _LANGGRAPH_IMPORT_PATHS:
+        monkeypatch.setitem(sys.modules, name, None)
 
     stage = WorkflowStage(
         name="research",

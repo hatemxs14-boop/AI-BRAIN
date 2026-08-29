@@ -1,35 +1,48 @@
 """
 Tests for core.orchestration.langgraph_orchestration_engine.
 
-Two tiers, deliberately:
+Two tiers:
 
 1. `test_langgraph_orchestration_engine_raises_clear_import_error_
-   when_missing` runs for real in every environment that doesn't have
-   `langgraph` installed (this sandbox included -- there is no
-   package-index access here at all, confirmed separately). It proves
-   the *fallback* behavior is real, not just documented.
+   when_missing` simulates "langgraph is not installed" deterministically
+   in ANY environment via `monkeypatch.setitem(sys.modules, "langgraph",
+   None)` -- Python's own import machinery raises `ModuleNotFoundError`
+   for `import langgraph`/`from langgraph... import ...` while that
+   sys.modules entry is `None`, independent of whether the real package
+   is actually installed on disk. This used to instead skip itself
+   whenever `langgraph` genuinely was installed ("the missing-dependency
+   path this test checks doesn't apply here") -- correct at the time,
+   but once this project's own reference machine had `langgraph`
+   installed for real (Build Phase 24), that left no environment in
+   which this fallback behavior was ever actually exercised. The fix
+   makes it run for real, everywhere, always -- proving the *fallback*
+   behavior is real, not just documented, regardless of the host
+   environment.
 
 2. `test_langgraph_orchestration_engine_runs_agent_to_completion` is
    skip-guarded with `pytest.importorskip("langgraph")` and only runs
    where `langgraph` is actually installed -- i.e. never in this
-   sandbox, but for real on the user's machine after `pip install -r
-   requirements.txt`. This is the same skip-guard pattern already
-   established in this project for the live-OpenAI tests in
-   tests/agents/test_real_agent_llm_loop.py: cleanly skipped where the
-   dependency is unavailable, and a real, unmocked exercise of the
-   actual library everywhere it is.
+   sandbox, but for real on the user's machine (confirmed passing,
+   Build Phase 24's own investigation). This is the same skip-guard
+   pattern already established in this project for the live-OpenAI
+   tests in tests/agents/test_real_agent_llm_loop.py: cleanly skipped
+   where the dependency is unavailable, and a real, unmocked exercise
+   of the actual library everywhere it is -- this one genuinely cannot
+   be made to run without a real `langgraph` installed, unlike tier 1
+   above, since it exercises the real compiled graph's `invoke()`, not
+   an import-failure branch.
 
 Per this module's own docstring in core/orchestration/
-langgraph_orchestration_engine.py, tier 2 is the first real
-verification that this project's StateGraph usage actually matches
-the installed langgraph API -- until it has run and passed once on a
-real machine, this engine should be treated as written-but-unverified,
-not done.
+langgraph_orchestration_engine.py, tier 2 was the first real
+verification that this project's StateGraph usage actually matches the
+installed langgraph API -- confirmed passing for real, see that
+module's docstring.
 """
 from __future__ import annotations
 
 import json
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
@@ -89,18 +102,27 @@ def _build_zero_tool_agent(tmp_dir: Path) -> AgentCore:
     return AgentCore(identity=identity, tools=interface)
 
 
-def test_langgraph_orchestration_engine_raises_clear_import_error_when_missing():
-    try:
-        import langgraph  # noqa: F401
-    except ImportError:
-        pass
-    else:
-        pytest.skip(
-            "langgraph is installed in this environment; the missing-"
-            "dependency path this test checks doesn't apply here -- "
-            "see the next test for the real-integration verification "
-            "instead."
-        )
+# Every exact dotted name core/orchestration/langgraph_orchestration_
+# engine.py's __init__ imports. Blanking only "langgraph" itself is NOT
+# sufficient: if "langgraph.graph" happens to already be cached in
+# sys.modules (e.g. from pytest-langsmith or another plugin importing
+# it eagerly at session start, or from a different test that already
+# ran for real in this same process), Python's import machinery
+# returns that cached submodule directly without ever re-checking the
+# (blanked) parent -- confirmed as a real machine failure ("DID NOT
+# RAISE ImportError") the first time this test used only
+# `sys.modules["langgraph"] = None`. Blanking every literal dotted
+# name actually imported, regardless of whether it happens to be
+# cached already, makes the very first cache lookup for that exact
+# name hit `None` and raise immediately, in any environment.
+_LANGGRAPH_IMPORT_PATHS = ("langgraph", "langgraph.graph")
+
+
+def test_langgraph_orchestration_engine_raises_clear_import_error_when_missing(
+    monkeypatch,
+):
+    for name in _LANGGRAPH_IMPORT_PATHS:
+        monkeypatch.setitem(sys.modules, name, None)
 
     from core.orchestration.langgraph_orchestration_engine import (
         LangGraphOrchestrationEngine,

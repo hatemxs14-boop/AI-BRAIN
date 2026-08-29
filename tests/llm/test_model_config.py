@@ -1,27 +1,46 @@
 """
 Tests for core.llm.model_config (Build Phase 18).
 
-Two tiers, deliberately -- the same split core/orchestration/
-langgraph_orchestration_engine.py's own test suite already established
-for exactly the same reason (see this project's tests/orchestration/
-test_langgraph_orchestration_engine.py):
+Two tiers -- but, as of the fix described below, BOTH now run for real
+and pass in every environment regardless of what is actually pip
+installed there, unlike the equivalent split in this project's
+tests/orchestration/test_langgraph_orchestration_engine.py (which
+still depends on the real environment for its own "missing" tier):
 
 1. Everything that does not require the `anthropic`/`openai` vendor
    SDKs -- all of load_model_config()'s validation, and
-   build_llm_client_factory_from_config()'s missing-API-key and
-   missing-package error paths -- runs for real in every environment,
-   this sandbox included (neither vendor package is installed here;
-   confirmed separately -- there is no package-index access in this
-   sandbox at all).
+   build_llm_client_factory_from_config()'s missing-API-key error path
+   -- runs for real in every environment.
+
+   The missing-*package* error path
+   (`test_factory_anthropic_missing_package_raises_clear_error`/
+   `test_factory_openai_missing_package_raises_clear_error`) used to
+   only run for real when the vendor package genuinely was not
+   installed, and otherwise skipped itself ("the missing-package path
+   this test checks doesn't apply here"). That was correct but
+   unsatisfying once a real machine had both `anthropic` and `openai`
+   installed (as this project's own reference machine now does,
+   confirmed via a real `pytest -v -rs` run) -- there was then no
+   environment left in which that branch of
+   `build_llm_client_factory_from_config()` was ever actually
+   exercised for real. Fixed by using `monkeypatch.setitem(sys.modules,
+   "<pkg>", None)`: Python's own import machinery raises
+   `ModuleNotFoundError` for any `import <pkg>` while
+   `sys.modules["<pkg>"]` is `None` (documented CPython behavior,
+   independent of whether the package is actually installed on disk),
+   so `factory()`'s own local `import anthropic`/`import openai`
+   genuinely fails inside the test, deterministically, in ANY
+   environment -- this sandbox, the user's real machine with both
+   packages installed, or a fresh clone with neither. `monkeypatch`
+   restores the real `sys.modules` entry automatically after the test,
+   so this never affects any other test (including the "builds a real
+   provider when installed" tests below, whichever order they run in).
 
 2. The "actually builds a real ClaudeProvider/OpenAIProvider when the
    vendor package IS installed" paths are skip-guarded with
    pytest.importorskip, and only run for real on a machine that has
-   run `pip install -r requirements.txt`. Per core/llm/model_config.py's
-   own top-of-file docstring, those two branches are written against
-   each SDK's documented client-construction API but have never
-   executed anywhere yet -- this is the first real verification of
-   them, still pending on a real machine, not merely written.
+   run `pip install -r requirements.txt`. Confirmed passing for real on
+   this project's own reference machine.
 
 Deliberately all flat module-level test_* functions, not test
 classes -- matching every other test file in this project (grep across
@@ -34,6 +53,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
@@ -356,17 +376,16 @@ def test_factory_empty_api_key_env_raises():
         os.environ.pop("SOME_EMPTY_VAR_XYZ", None)
 
 
-def test_factory_anthropic_missing_package_raises_clear_error():
-    try:
-        import anthropic  # noqa: F401
-    except ImportError:
-        pass
-    else:
-        pytest.skip(
-            "anthropic is installed in this environment; the "
-            "missing-package path this test checks doesn't apply "
-            "here -- see the importorskip-guarded test instead."
-        )
+def test_factory_anthropic_missing_package_raises_clear_error(monkeypatch):
+    # Simulates "anthropic is not installed" deterministically, in ANY
+    # environment, via Python's own documented import behavior: an
+    # `import anthropic` while sys.modules["anthropic"] is None raises
+    # ModuleNotFoundError, regardless of whether the real package is
+    # actually installed on disk. `monkeypatch.setitem` restores the
+    # real entry (present or absent) automatically after this test --
+    # see this module's own top-of-file docstring for the full
+    # rationale.
+    monkeypatch.setitem(sys.modules, "anthropic", None)
 
     os.environ["FAKE_ANTHROPIC_KEY_XYZ"] = "sk-fake"
     try:
@@ -384,17 +403,9 @@ def test_factory_anthropic_missing_package_raises_clear_error():
         os.environ.pop("FAKE_ANTHROPIC_KEY_XYZ", None)
 
 
-def test_factory_openai_missing_package_raises_clear_error():
-    try:
-        import openai  # noqa: F401
-    except ImportError:
-        pass
-    else:
-        pytest.skip(
-            "openai is installed in this environment; the "
-            "missing-package path this test checks doesn't apply "
-            "here -- see the importorskip-guarded test instead."
-        )
+def test_factory_openai_missing_package_raises_clear_error(monkeypatch):
+    # Same simulated-absence technique as the anthropic test above.
+    monkeypatch.setitem(sys.modules, "openai", None)
 
     os.environ["FAKE_OPENAI_KEY_XYZ"] = "sk-fake"
     try:
