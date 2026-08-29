@@ -12,6 +12,8 @@ from core.agents.agent_loop import (
 
 from core.agents.decision_engine import AgentDecisionEngine
 
+from core.agents.guardrails import OutputGuardrailEngine
+
 
 # ---------------------------------------------------------------------
 # Build Phase 24 -- real multi-agent workflows on top of LangGraph.
@@ -77,13 +79,18 @@ from core.agents.decision_engine import AgentDecisionEngine
 # have passed for real once, treat only that piece (not the whole
 # module) as unverified.
 #
-# SCOPE: this engine is a new, standalone, opt-in capability. It is not
-# wired into Kernel in this phase -- Kernel still only ever selects and
-# runs one agent per task, unchanged. Wiring a multi-agent workflow
-# into Kernel (so it can be handed a task the same way a single agent
-# is today) is deliberately left for a follow-up phase, once this
-# piece's interrupt/resume path has been confirmed correct on a real
-# machine.
+# SCOPE, updated: this engine started as a new, standalone, opt-in
+# capability, not wired into Kernel. It is now wired in --
+# Kernel.run_multi_agent_workflow()/resume_multi_agent_workflow()
+# (core/kernel/kernel.py) build a chain of WorkflowStage from already-
+# registered AgentRegistrations by subject, and thread the Kernel's own
+# `guardrail_engine` (Build Phase 23) into every stage it builds via
+# WorkflowStage.guardrail_engine (see that field's own docstring) --
+# exactly mirroring how Kernel._execute_once() threads the same
+# guardrail_engine into a single agent's own AgentExecutionLoop.
+# Kernel still does NOT thread checkpoint_store into a multi-agent
+# workflow's own stages -- a deliberately narrower scope boundary than
+# even guardrail_engine's, left for a future phase.
 # ---------------------------------------------------------------------
 
 
@@ -151,6 +158,19 @@ class WorkflowStage:
     ] = _default_task_template
     max_steps: int = 10
     requires_human_approval: bool = False
+    guardrail_engine: OutputGuardrailEngine | None = None
+    """
+    Optional, per-stage (Kernel.run_multi_agent_workflow() passes the
+    Kernel's own `self.guardrail_engine` here for every stage it
+    builds, exactly mirroring `_execute_once`'s identical treatment of
+    a single agent -- see kernel.py's own docstring). `None` by
+    default: a stage built directly (not through the Kernel) has no
+    guardrail checking unless explicitly given one, the same opt-in
+    convention every other optional component in this project follows.
+    Deliberately does NOT cover a triggered independent-verification
+    run any more than Kernel's own guardrail_engine does -- there is
+    no such concept in this engine yet.
+    """
 
     def __post_init__(self) -> None:
 
@@ -190,6 +210,14 @@ class WorkflowStage:
         if not isinstance(self.requires_human_approval, bool):
             raise TypeError(
                 "WorkflowStage.requires_human_approval must be a bool."
+            )
+
+        if self.guardrail_engine is not None and not isinstance(
+            self.guardrail_engine, OutputGuardrailEngine
+        ):
+            raise TypeError(
+                "WorkflowStage.guardrail_engine must be an "
+                "OutputGuardrailEngine or None."
             )
 
 
@@ -253,6 +281,7 @@ def _make_stage_node(stage: WorkflowStage):
             agent=agent,
             decision_engine=decision_engine,
             max_steps=stage.max_steps,
+            guardrail_engine=stage.guardrail_engine,
         )
 
         result = loop.run()

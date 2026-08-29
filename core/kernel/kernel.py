@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 from core.agents.agent_core import (
     AgentCore,
@@ -37,6 +37,12 @@ from core.memory.memory_store import (
 
 from core.orchestration.engine_factory import (
     create_default_orchestration_engine,
+)
+
+from core.orchestration.multi_agent_workflow import (
+    MultiAgentWorkflowEngine,
+    MultiAgentWorkflowResult,
+    WorkflowStage,
 )
 
 from core.orchestration.orchestration_engine import (
@@ -880,6 +886,18 @@ class Kernel:
     checkpoint either) rather than introducing a new one -- widening
     either concern to cover that secondary, optional run is future
     work, not a silently-assumed part of this phase.
+
+    `run_multi_agent_workflow`/`resume_multi_agent_workflow` (Build
+    Phase 25) chain already-registered agents into a real, compiled
+    LangGraph graph (core.orchestration.multi_agent_workflow's
+    MultiAgentWorkflowEngine, Build Phase 24) with a genuine
+    cross-call pause/resume for human-approval gates -- see that pair
+    of methods' own docstrings for exactly how this differs from both
+    `run()` and `run_workflow()`. `self._multi_agent_engines` keeps
+    one live engine per currently-paused run, keyed by its own
+    `thread_id`, purely in-memory (no persistence across a process
+    restart -- MultiAgentWorkflowEngine's own MemorySaver checkpointer
+    is itself in-memory-only, see that module's docstring).
     """
 
     def __init__(
@@ -904,6 +922,19 @@ class Kernel:
 
         self._registrations: list[AgentRegistration] = []
         self._workflows: list[WorkflowDefinition] = []
+
+        # Build Phase 25: one MultiAgentWorkflowEngine per in-flight
+        # (i.e. currently AWAITING_APPROVAL) multi-agent workflow run,
+        # keyed by that run's own thread_id -- kept around so
+        # resume_multi_agent_workflow() can continue the SAME compiled
+        # graph's SAME in-memory checkpoint (MemorySaver) rather than
+        # a fresh one that would have no memory of the paused run. See
+        # run_multi_agent_workflow()'s own docstring for the full
+        # lifecycle (an engine is removed here once its run reaches a
+        # terminal COMPLETED/HALTED status, exactly like Build Phase
+        # 22's FileCheckpointStore deletes a checkpoint once its loop
+        # actually returns).
+        self._multi_agent_engines: dict[str, MultiAgentWorkflowEngine] = {}
 
         self.max_recovery_attempts = max_recovery_attempts
 
@@ -1502,6 +1533,184 @@ class Kernel:
             reason=None,
             token_usage=_workflow_token_usage(),
         )
+
+    def run_multi_agent_workflow(
+        self,
+        *,
+        subjects: Sequence[str],
+        task: str,
+        thread_id: str,
+        approval_gates: Mapping[str, bool] | None = None,
+        max_steps: int = 10,
+    ) -> MultiAgentWorkflowResult:
+        """
+        Build Phase 25: chain already-registered agents (by `subjects`,
+        in the given order) into a real MultiAgentWorkflowEngine (Build
+        Phase 24) and run it -- e.g.
+        subjects=("research_agent", "writer_agent", "reviewer_agent").
+
+        Entirely separate from both Kernel.run() (single agent) and
+        Kernel.run_workflow() (Build Phase 15's own declarative,
+        plain-Python-loop multi-step mechanism, which cannot pause and
+        later continue past an approval gate -- an "AWAITING_APPROVAL"
+        WorkflowRunResult just stops, with nothing to resume it). This
+        method's real advantage over run_workflow() is exactly that
+        gap: a stage named in `approval_gates` pauses the whole
+        workflow via a native LangGraph `interrupt()` (Build Phase 24),
+        and a LATER, SEPARATE call to `resume_multi_agent_workflow()`
+        with the SAME `thread_id` continues it from exactly where it
+        paused -- real cross-call pause/resume, not "stop and report."
+
+        `approval_gates` maps a subject to `True` to mark that stage as
+        requiring human approval before the workflow advances past it
+        (see WorkflowStage.requires_human_approval); a subject absent
+        from this mapping (or the mapping itself omitted) never pauses.
+
+        Every stage built here is threaded with this Kernel's own
+        `self.guardrail_engine` (Build Phase 23), exactly mirroring how
+        `_execute_once` threads it into a single agent's own
+        AgentExecutionLoop -- `None` unless this Kernel was itself
+        constructed with one.
+
+        Deliberately narrower than Kernel.run(): no NORMALIZE/CLASSIFY/
+        context-retrieval/policy-evaluation/independent-verification
+        lifecycle around this call, and no `checkpoint_store` support
+        for a stage's own in-flight progress (a stage that crashes
+        mid-task restarts that stage from scratch on any future retry,
+        unlike Kernel.resume()'s own crash recovery) -- both are real,
+        honest, documented scope boundaries for this first Kernel-wired
+        version, not silently-assumed coverage.
+
+        Raises TypeError/ValueError for a bad `subjects`/`approval_gates`,
+        or if `subjects` names a subject with no matching
+        AgentRegistration -- the same "fail loud on misconfiguration"
+        convention this class already uses elsewhere.
+        """
+
+        if not isinstance(subjects, Sequence) or isinstance(
+            subjects, (str, bytes)
+        ):
+            raise TypeError(
+                "subjects must be a sequence of subject strings."
+            )
+
+        if not subjects:
+            raise ValueError("subjects must not be empty.")
+
+        if approval_gates is not None and not isinstance(
+            approval_gates, Mapping
+        ):
+            raise TypeError("approval_gates must be a Mapping or None.")
+
+        stages = self._build_multi_agent_stages(
+            subjects=subjects,
+            approval_gates=approval_gates or {},
+            max_steps=max_steps,
+        )
+
+        engine = MultiAgentWorkflowEngine(stages)
+
+        result = engine.run(task=task, thread_id=thread_id)
+
+        if result.status == "AWAITING_APPROVAL":
+            self._multi_agent_engines[thread_id] = engine
+        else:
+            self._multi_agent_engines.pop(thread_id, None)
+
+        return result
+
+    def resume_multi_agent_workflow(
+        self,
+        *,
+        thread_id: str,
+        approval: object,
+    ) -> MultiAgentWorkflowResult:
+        """
+        Continue a multi-agent workflow `run_multi_agent_workflow()`
+        left AWAITING_APPROVAL for `thread_id`. See that method's own
+        docstring for the full pause/resume design.
+
+        Raises ValueError if `thread_id` names no currently-paused
+        workflow -- either it was never started, already ran to a
+        terminal status, or this Kernel instance is not the one that
+        started it (the paused engine lives only in this Kernel's own
+        in-memory `_multi_agent_engines`, not on disk -- see
+        MultiAgentWorkflowEngine's own module docstring on
+        MemorySaver's in-memory-only scope).
+        """
+
+        if not isinstance(thread_id, str) or not thread_id.strip():
+            raise ValueError("thread_id must be a non-empty string.")
+
+        engine = self._multi_agent_engines.get(thread_id)
+
+        if engine is None:
+            raise ValueError(
+                f"No paused multi-agent workflow found for "
+                f"thread_id={thread_id!r}. It may never have been "
+                "started, may have already reached a terminal status, "
+                "or may have been started on a different Kernel "
+                "instance."
+            )
+
+        result = engine.resume(thread_id=thread_id, approval=approval)
+
+        if result.status != "AWAITING_APPROVAL":
+            self._multi_agent_engines.pop(thread_id, None)
+
+        return result
+
+    def _build_multi_agent_stages(
+        self,
+        *,
+        subjects: Sequence[str],
+        approval_gates: Mapping[str, bool],
+        max_steps: int,
+    ) -> tuple[WorkflowStage, ...]:
+        """
+        Deliberately does NOT reuse `_find_registration` -- that
+        helper's own docstring documents it as only ever being called
+        with a subject `register_workflow()` has already validated,
+        raising an "internal error" RuntimeError otherwise. Here,
+        `subjects` is ordinary caller input to a public method, never
+        pre-validated by anything -- an unknown subject is a normal,
+        expected, user-facing ValueError, not an internal-error
+        RuntimeError.
+        """
+
+        stages: list[WorkflowStage] = []
+
+        for subject in subjects:
+
+            registration = None
+
+            for candidate in self._registrations:
+                if candidate.subject == subject:
+                    registration = candidate
+                    break
+
+            if registration is None:
+                raise ValueError(
+                    f"No AgentRegistration found for subject "
+                    f"{subject!r}. Register it with "
+                    "Kernel.register_agent() before including it in a "
+                    "multi-agent workflow."
+                )
+
+            stages.append(
+                WorkflowStage(
+                    name=registration.subject,
+                    build_agent=registration.build_agent,
+                    build_decision_engine=registration.build_decision_engine,
+                    max_steps=max_steps,
+                    requires_human_approval=bool(
+                        approval_gates.get(subject, False)
+                    ),
+                    guardrail_engine=self.guardrail_engine,
+                )
+            )
+
+        return tuple(stages)
 
     def _select_workflow(
         self,
