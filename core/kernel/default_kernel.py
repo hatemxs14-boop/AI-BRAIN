@@ -45,6 +45,7 @@ from core.kernel.kernel import (
 
 from core.kernel.workflow_config import (
     build_workflow_from_config,
+    load_workflow_configs_from_directory,
 )
 
 from core.llm.llm_client import (
@@ -394,6 +395,7 @@ def build_default_kernel(
     enable_memory_retrieval: bool = False,
     enable_research_write_review_workflow: bool = False,
     enable_write_and_review_workflow: bool = False,
+    workflow_config_dir: str | Path | None = None,
 ) -> Kernel:
     """
     Build a Kernel with research_agent, writer_agent, and
@@ -501,6 +503,18 @@ def build_default_kernel(
     reads/writes the same `findings_root`/`reports_root` locations.
     Defaults to False for the same reason every other `enable_*` flag
     on this function does.
+
+    `workflow_config_dir` (Build Phase 17, default None) opts into
+    loading additional workflows straight from JSON files on disk --
+    every "*.json" file directly inside this directory is loaded via
+    core.kernel.workflow_config.load_workflow_configs_from_directory()
+    and registered on this Kernel, so a NEW workflow can be added by
+    writing one JSON file, with no code change to this project at all.
+    See that function's own docstring for the exact file format and
+    its "fail loud on a bad file" behavior. None (the default) skips
+    this entirely -- no directory is read, no behavior changes, same
+    "no existing caller's behavior changes unless they opt in" reason
+    every other flag on this function already follows.
     """
 
     if decision_engine_factory is None:
@@ -679,5 +693,9 @@ def build_default_kernel(
                 }
             )
         )
+
+    if workflow_config_dir is not None:
+        for workflow in load_workflow_configs_from_directory(workflow_config_dir):
+            kernel.register_workflow(workflow)
 
     return kernel

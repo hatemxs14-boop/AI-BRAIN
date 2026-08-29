@@ -1,22 +1,27 @@
 """
 End-to-end tests wiring the real Kernel (core.kernel.kernel) to the
 real writer_agent/reviewer_agent stack through core.kernel.
-default_kernel.build_default_kernel()'s new (Build Phase 16)
-"write_and_review" WorkflowDefinition -- built entirely from a config
-dict via core.kernel.workflow_config.build_workflow_from_config(),
-rather than the hand-written can_handle/build_task functions Build
-Phase 15's own "research_write_review" workflow uses.
+default_kernel.build_default_kernel()'s "write_and_review"
+WorkflowDefinition -- built from a config dict via core.kernel.
+workflow_config.build_workflow_from_config() (Build Phase 16), and
+from an actual JSON file on disk via `workflow_config_dir` (Build
+Phase 17) -- rather than the hand-written can_handle/build_task
+functions Build Phase 15's own "research_write_review" workflow uses.
 
 Mirrors tests/kernel/test_kernel_workflow_integration.py's pattern (a
 local deterministic decision engine, isolated temp roots, a
 self-contained proof of the full stack) rather than importing from
 that file. The point of this file specifically is to prove that a
-workflow built from a plain config dict behaves identically, through
-the real Kernel/security stack, to one built from hand-written Python
--- not to re-test build_workflow_from_config()'s own mechanics (see
-tests/kernel/test_workflow_config.py for that).
+workflow built from a plain config dict -- or loaded straight from a
+JSON file with no Python at all -- behaves identically, through the
+real Kernel/security stack, to one built from hand-written Python --
+not to re-test build_workflow_from_config()'s/load_workflow_configs_
+from_directory()'s own mechanics (see tests/kernel/test_workflow_
+config.py for that).
 """
 from __future__ import annotations
+
+import json
 
 import os
 import shutil
@@ -280,3 +285,96 @@ def test_write_and_review_workflow_stops_at_the_first_approval_gate():
         shutil.rmtree(findings_root)
         shutil.rmtree(reports_root)
         shutil.rmtree(audit_dir)
+
+
+# ---------------------------------------------------------------------
+# workflow_config_dir (Build Phase 17): the same "write_and_review"
+# pipeline, loaded from an actual JSON file on disk -- no Python
+# involved in defining the workflow at all.
+# ---------------------------------------------------------------------
+
+def test_workflow_config_dir_loads_and_runs_a_workflow_from_a_json_file():
+    docs_root = _make_documents_root()
+    findings_root = _make_findings_root()
+    reports_root = _make_reports_root()
+    audit_dir = tempfile.mkdtemp()
+    workflow_config_dir = tempfile.mkdtemp()
+    try:
+        config_path = Path(workflow_config_dir, "write_and_review.json")
+        config_path.write_text(
+            json.dumps(
+                {
+                    "name": "write_and_review_from_disk",
+                    "description": (
+                        "Same writer_agent -> reviewer_agent pipeline "
+                        "as build_default_kernel()'s own built-in "
+                        "'write_and_review', but defined entirely in "
+                        "this JSON file -- no Python code names this "
+                        "workflow anywhere."
+                    ),
+                    "trigger_keywords_all": ["draft", "review"],
+                    "steps": [
+                        {
+                            "subject": "writer_agent",
+                            "task_template": "{original_task}",
+                        },
+                        {
+                            "subject": "reviewer_agent",
+                            "task_template": "Review {previous_artifact_path}.",
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        kernel = build_default_kernel(
+            decision_engine_factory=lambda: _WriteThenReviewEngine(),
+            documents_root=docs_root,
+            findings_root=findings_root,
+            reports_root=reports_root,
+            serper_api_key="unused-but-required-key",
+            audit_log_path=os.path.join(audit_dir, "audit.jsonl"),
+            orchestration_engine=SequentialOrchestrationEngine(),
+            workflow_config_dir=workflow_config_dir,
+        )
+
+        assert [w.name for w in kernel._workflows] == ["write_and_review_from_disk"]
+
+        result = kernel.run_workflow(
+            "Draft a report about the topic, then review it."
+        )
+
+        assert result.status == "COMPLETED"
+        assert result.workflow_name == "write_and_review_from_disk"
+        assert [s.subject for s in result.completed_steps] == [
+            "writer_agent",
+            "reviewer_agent",
+        ]
+        assert Path(reports_root, "report.md").exists()
+    finally:
+        shutil.rmtree(docs_root)
+        shutil.rmtree(findings_root)
+        shutil.rmtree(reports_root)
+        shutil.rmtree(audit_dir)
+        shutil.rmtree(workflow_config_dir)
+
+
+def test_workflow_config_dir_none_by_default_registers_nothing_extra():
+    docs_root = _make_documents_root()
+    findings_root = _make_findings_root()
+    reports_root = _make_reports_root()
+    try:
+        kernel = build_default_kernel(
+            decision_engine_factory=lambda: _WriteThenReviewEngine(),
+            documents_root=docs_root,
+            findings_root=findings_root,
+            reports_root=reports_root,
+            serper_api_key="unused-but-required-key",
+            orchestration_engine=SequentialOrchestrationEngine(),
+        )
+        assert kernel._workflows == []
+    finally:
+        shutil.rmtree(docs_root)
+        shutil.rmtree(findings_root)
+        shutil.rmtree(reports_root)

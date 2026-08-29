@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from core.agents.agent_loop import (
@@ -339,4 +341,112 @@ def build_workflow_from_config(config: Mapping[str, Any]) -> WorkflowDefinition:
         description=description,
         can_handle=_can_handle,
         steps=tuple(steps),
+    )
+
+
+# ---------------------------------------------------------------------
+# Build Phase 17: loading a workflow config straight from a JSON file
+# on disk, and a whole directory of them.
+#
+# build_workflow_from_config() above (Build Phase 16) turned "write a
+# new can_handle function and one build_task function per step" into
+# "write a dict" -- a real reduction in what a new workflow costs to
+# add, but that dict still had to be written inline in Python (e.g.
+# core/kernel/default_kernel.py's own "write_and_review" registration).
+# This phase closes the remaining gap: since a workflow config is
+# already a plain, JSON-serializable mapping (build_workflow_from_
+# config never required anything Python-specific -- strings, lists,
+# and dicts only), it can be written as an actual .json file and
+# loaded at Kernel-build time with no code change and no import at
+# all. This is the most direct answer yet to the user's own standing
+# product direction: describing a new commercial workflow now means
+# writing one JSON file, not touching this project's source code.
+#
+# load_workflow_configs_from_directory() fails LOUD -- raising
+# WorkflowConfigError immediately, naming the offending file -- on the
+# first config file that doesn't load, rather than silently skipping a
+# broken file and registering only the rest. This matches this
+# project's existing "fail at build time on a bad config, don't
+# degrade silently" convention (e.g. PolicyEngine.evaluate_agent_
+# scope()/evaluate_agent_permission_alignment() both raise immediately
+# on a real mismatch rather than registering a partially-broken agent).
+# A caller who genuinely wants best-effort partial loading can still
+# call load_workflow_config_file() on each file itself and handle
+# WorkflowConfigError per file -- that policy decision is deliberately
+# left to the caller rather than baked into this helper.
+# ---------------------------------------------------------------------
+
+
+def load_workflow_config_file(path: str | Path) -> WorkflowDefinition:
+    """
+    Read one workflow config from a JSON file on disk and build it via
+    build_workflow_from_config() -- see that function's own docstring
+    for the exact expected shape.
+
+    Raises WorkflowConfigError, naming `path`, when: the file does not
+    exist or cannot be read; its contents are not valid JSON; or the
+    parsed JSON is not itself a valid workflow config (in which case
+    the underlying build_workflow_from_config() error is preserved as
+    this error's __cause__ and folded into its message).
+    """
+
+    file_path = Path(path)
+
+    if not file_path.is_file():
+        raise WorkflowConfigError(
+            f"Workflow config file does not exist: {file_path}"
+        )
+
+    try:
+        raw_text = file_path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise WorkflowConfigError(
+            f"Could not read workflow config file {file_path}: {error}"
+        ) from error
+
+    try:
+        config = json.loads(raw_text)
+    except json.JSONDecodeError as error:
+        raise WorkflowConfigError(
+            f"Workflow config file {file_path} is not valid JSON: {error}"
+        ) from error
+
+    try:
+        return build_workflow_from_config(config)
+    except WorkflowConfigError as error:
+        raise WorkflowConfigError(
+            f"Workflow config file {file_path} is invalid: {error}"
+        ) from error
+
+
+def load_workflow_configs_from_directory(
+    directory: str | Path,
+) -> tuple[WorkflowDefinition, ...]:
+    """
+    Load every top-level "*.json" file in `directory` (not recursive)
+    as a workflow config, via load_workflow_config_file(), in sorted
+    filename order -- a deterministic, reproducible registration order,
+    which matters for a genuine can_handle tie (see WorkflowDefinition's
+    own docstring: first match in registration order wins).
+
+    Returns an empty tuple when `directory` does not exist, or exists
+    but contains no "*.json" files -- a missing or empty workflow
+    config directory is not itself an error, mirroring every other
+    optional, opt-in config surface in this project (e.g. `enable_*`
+    flags on build_default_kernel() that simply do nothing when unset).
+
+    Raises WorkflowConfigError immediately -- naming the offending
+    file -- on the first file that fails to load; see this module's
+    own docstring above for why this deliberately does not silently
+    skip a broken file and register only the rest.
+    """
+
+    directory_path = Path(directory)
+
+    if not directory_path.is_dir():
+        return ()
+
+    return tuple(
+        load_workflow_config_file(config_path)
+        for config_path in sorted(directory_path.glob("*.json"))
     )

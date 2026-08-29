@@ -1,7 +1,9 @@
 """
-Tests for core.kernel.workflow_config (Build Phase 16): config-driven
-WorkflowDefinition construction -- build_task_from_template() and
-build_workflow_from_config().
+Tests for core.kernel.workflow_config: config-driven WorkflowDefinition
+construction -- build_task_from_template()/build_workflow_from_config()
+(Build Phase 16), and load_workflow_config_file()/load_workflow_
+configs_from_directory() (Build Phase 17, loading a workflow config
+straight from a JSON file on disk).
 
 Uses the same minimal, isolated fixtures tests/kernel/test_kernel_
 workflow.py already established (a bare AgentLoopResult/AgentContext,
@@ -9,10 +11,15 @@ no real agent stack) since this module has nothing to do with any
 specific agent -- it is a general-purpose config-to-WorkflowDefinition
 builder. tests/kernel/test_kernel_workflow_config_integration.py covers
 the full real-stack "write_and_review" workflow build_default_kernel()
-now wires from a config dict built with this module.
+now wires, both from an inline config dict and from a JSON file on
+disk.
 """
 from __future__ import annotations
 
+import json
+import shutil
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -26,6 +33,8 @@ from core.kernel.workflow_config import (
     WorkflowConfigError,
     build_task_from_template,
     build_workflow_from_config,
+    load_workflow_config_file,
+    load_workflow_configs_from_directory,
 )
 
 
@@ -268,3 +277,113 @@ def test_build_workflow_from_config_steps_build_task_end_to_end():
         "Draft a report about the topic, then review it.", previous
     )
     assert task_2 == "Review report.md."
+
+
+# ---------------------------------------------------------------------
+# load_workflow_config_file / load_workflow_configs_from_directory
+# (Build Phase 17)
+# ---------------------------------------------------------------------
+
+def _write_config_file(directory: Path, filename: str, config: dict) -> Path:
+    path = directory / filename
+    path.write_text(json.dumps(config), encoding="utf-8")
+    return path
+
+
+def test_load_workflow_config_file_raises_when_file_missing():
+    with pytest.raises(WorkflowConfigError):
+        load_workflow_config_file("/nonexistent/path/does-not-exist.json")
+
+
+def test_load_workflow_config_file_raises_on_invalid_json():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        path = tmp_dir / "broken.json"
+        path.write_text("{not valid json", encoding="utf-8")
+        with pytest.raises(WorkflowConfigError):
+            load_workflow_config_file(path)
+    finally:
+        shutil.rmtree(tmp_dir)
+
+
+def test_load_workflow_config_file_raises_on_invalid_config_content():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        # Valid JSON, but missing required fields -- the underlying
+        # build_workflow_from_config() error should surface, wrapped
+        # with the file's own path.
+        path = _write_config_file(tmp_dir, "incomplete.json", {"name": "x"})
+        with pytest.raises(WorkflowConfigError):
+            load_workflow_config_file(path)
+    finally:
+        shutil.rmtree(tmp_dir)
+
+
+def test_load_workflow_config_file_returns_a_real_workflow_definition():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        path = _write_config_file(tmp_dir, "write_and_review.json", _valid_config())
+        workflow = load_workflow_config_file(path)
+        assert isinstance(workflow, WorkflowDefinition)
+        assert workflow.name == "write_and_review"
+    finally:
+        shutil.rmtree(tmp_dir)
+
+
+def test_load_workflow_configs_from_directory_returns_empty_for_missing_directory():
+    assert load_workflow_configs_from_directory("/nonexistent/workflows-dir") == ()
+
+
+def test_load_workflow_configs_from_directory_returns_empty_for_empty_directory():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        assert load_workflow_configs_from_directory(tmp_dir) == ()
+    finally:
+        shutil.rmtree(tmp_dir)
+
+
+def test_load_workflow_configs_from_directory_ignores_non_json_files():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        (tmp_dir / "README.md").write_text("not a workflow", encoding="utf-8")
+        assert load_workflow_configs_from_directory(tmp_dir) == ()
+    finally:
+        shutil.rmtree(tmp_dir)
+
+
+def test_load_workflow_configs_from_directory_loads_all_files_in_sorted_order():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        _write_config_file(
+            tmp_dir,
+            "b_second.json",
+            _valid_config(name="second_workflow"),
+        )
+        _write_config_file(
+            tmp_dir,
+            "a_first.json",
+            _valid_config(name="first_workflow"),
+        )
+
+        workflows = load_workflow_configs_from_directory(tmp_dir)
+
+        assert [w.name for w in workflows] == [
+            "first_workflow",
+            "second_workflow",
+        ]
+    finally:
+        shutil.rmtree(tmp_dir)
+
+
+def test_load_workflow_configs_from_directory_raises_naming_the_bad_file():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        _write_config_file(tmp_dir, "a_good.json", _valid_config(name="good_one"))
+        bad_path = _write_config_file(tmp_dir, "b_bad.json", {"name": "incomplete"})
+
+        with pytest.raises(WorkflowConfigError) as excinfo:
+            load_workflow_configs_from_directory(tmp_dir)
+
+        assert str(bad_path) in str(excinfo.value)
+    finally:
+        shutil.rmtree(tmp_dir)
