@@ -7,6 +7,10 @@ from core.agents.decision_engine import (
     AgentDecisionEngine,
 )
 
+from core.agents.guardrails import (
+    OutputGuardrailEngine,
+)
+
 from core.agents.llm_decision_engine import (
     LLMDecisionEngine,
 )
@@ -48,9 +52,17 @@ from core.kernel.workflow_config import (
     load_workflow_configs_from_directory,
 )
 
+from core.llm.budget import (
+    TokenBudget,
+)
+
 from core.llm.caching_llm_client import (
     CachingLLMClient,
     ResponseCache,
+)
+
+from core.llm.embeddings import (
+    EmbeddingClient,
 )
 
 from core.llm.llm_client import (
@@ -60,6 +72,10 @@ from core.llm.llm_client import (
 from core.llm.model_config import (
     build_llm_client_factory_from_config,
     load_model_config,
+)
+
+from core.llm.model_tier import (
+    ModelTierRouter,
 )
 
 from core.memory.memory_store import (
@@ -410,6 +426,10 @@ def build_default_kernel(
     enable_response_cache: bool = False,
     response_cache_max_entries: int = 256,
     response_cache_nondeterministic: bool = False,
+    guardrail_engine: OutputGuardrailEngine | None = None,
+    token_budget: TokenBudget | None = None,
+    model_tier_router: ModelTierRouter | None = None,
+    semantic_embedding_client: EmbeddingClient | None = None,
 ) -> Kernel:
     """
     Build a Kernel with research_agent, writer_agent, and
@@ -584,6 +604,40 @@ def build_default_kernel(
     `cache_nondeterministic` -- ignored when `enable_response_cache`
     is False. See CachingLLMClient's own docstring for what setting
     this to True actually opts into and why it is never the default.
+
+    `guardrail_engine` (Build Phase 23, default None), `token_budget`
+    (Build Phase 26, default None), `model_tier_router` (Build Phase
+    27, default None), and `semantic_embedding_client` (Build Phase
+    28, default None) are passed straight through to Kernel() --
+    see that class's own docstring (core/kernel/kernel.py) for exactly
+    what each one does. Unlike `enable_memory_retrieval`/
+    `enable_independent_verification` above, these four are NOT
+    `enable_*` booleans that build something internally: the caller
+    constructs the real object directly (an already-configured
+    OutputGuardrailEngine -- itself optionally carrying a
+    core.agents.llama_guard.LlamaGuardClient for Build Phase 29's own
+    confidence gate -- a TokenBudget, a ModelTierRouter with real
+    model names, or an EmbeddingClient such as
+    core.llm.embeddings.build_embedding_client_factory()()) and passes
+    it in, exactly mirroring this same function's own
+    `orchestration_engine`/`policy_engine` parameters immediately
+    above. This is a deliberate fix, not an oversight being corrected
+    quietly: for four Build Phases (23, 26, 27, 28) this function had
+    no parameter for any of these at all, so a caller could only reach
+    them by bypassing this function and constructing Kernel() by hand
+    -- confirmed by direct code inspection, not assumption, immediately
+    after Build Phase 29 shipped. All four default to `None`, so every
+    existing caller of this function keeps its exact current behavior,
+    cost, and test counts unless it explicitly opts in by passing one
+    of these four objects -- the same "no existing caller changes
+    unless it asks" rule every other parameter on this function already
+    follows. `checkpoint_store` (Build Phase 22) deliberately has NO
+    equivalent parameter here: unlike these four, it was never a
+    Kernel() *constructor* argument in the first place -- it is a
+    per-call argument to `Kernel.run()`/`run_workflow()`/`resume()`
+    (see Kernel.run()'s own signature), so a Kernel this function
+    returns already supports it fully, at the call site, with nothing
+    to add here.
     """
 
     if decision_engine_factory is None:
@@ -692,6 +746,10 @@ def build_default_kernel(
         policy_engine=policy_engine,
         independent_verifier=independent_verifier,
         memory_store=memory_store,
+        guardrail_engine=guardrail_engine,
+        token_budget=token_budget,
+        model_tier_router=model_tier_router,
+        semantic_embedding_client=semantic_embedding_client,
     )
 
     kernel.register_agent(
