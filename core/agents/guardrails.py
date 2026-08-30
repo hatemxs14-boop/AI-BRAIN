@@ -98,6 +98,37 @@ and core/kernel/kernel.py's own docstring on `guardrail_engine` for
 why, like Build Phase 22's `checkpoint_store`, a configured guardrail
 engine currently means the Kernel bypasses the pluggable
 OrchestrationEngine seam and drives AgentExecutionLoop directly.
+
+Build Phase 29: an optional, opt-in CONFIDENCE GATE, backed by a real,
+self-hosted Llama Guard model (see core/agents/llama_guard.py's own
+module docstring for the full design and the ECC-research provenance
+of this specific shape). This does NOT run an LLM check on every
+action -- that would trade this module's own zero-marginal-cost
+determinism for real latency and (however small) real cost, for
+findings the existing regex rules already resolve confidently. It only
+asks Llama Guard about the findings THIS module's own rules already
+flag as its least confident: the MEDIUM-severity findings (the
+uncorroborated form of `injection_compliance`, and `topic_drift`,
+which this module's own docstring already calls "the crudest, most
+conservative" of the three rules). A HIGH-severity finding
+(`credential_leak`, or `injection_compliance` once corroborated by
+earlier tool output) is already a confident, deterministic match and
+is never sent to Llama Guard at all. When configured via
+`llama_guard_client`, at most ONE real `classify()` call is made per
+`evaluate()` regardless of how many MEDIUM findings are present in
+that one call (mirroring MemoryStore.search_semantic()'s own "never
+one call per record" discipline); its real verdict then escalates
+every MEDIUM finding to HIGH (Llama Guard independently agrees this is
+unsafe) or downgrades it to LOW (Llama Guard reviewed it and found it
+safe, so the heuristic-only signal is not worth continued attention).
+A genuine Llama Guard failure (the self-hosted server isn't running, a
+network error, a malformed response) is caught and degrades this gate
+back to the original, unmodified regex-only findings -- exactly the
+same "an optional, additive step never fails an otherwise-real
+evaluation" tolerance `_retrieve_context`
+(core/kernel/kernel.py) already established for its own Build Phase
+28 semantic-search confidence path. Defaults to `None`, in which case
+this engine behaves exactly as it did before this phase.
 """
 from __future__ import annotations
 
@@ -112,6 +143,10 @@ from core.agents.agent_action import (
 
 from core.agents.agent_context import (
     AgentContext,
+)
+
+from core.agents.llama_guard import (
+    LlamaGuardClient,
 )
 
 
@@ -288,6 +323,7 @@ class OutputGuardrailEngine:
         injection_phrases: tuple[str, ...] | None = None,
         credential_patterns: tuple[re.Pattern[str], ...] | None = None,
         min_steps_for_drift_check: int = 3,
+        llama_guard_client: LlamaGuardClient | None = None,
     ) -> None:
 
         if not isinstance(enforce, bool):
@@ -341,6 +377,15 @@ class OutputGuardrailEngine:
 
         self.min_steps_for_drift_check = min_steps_for_drift_check
 
+        if llama_guard_client is not None and not isinstance(
+            llama_guard_client, LlamaGuardClient
+        ):
+            raise TypeError(
+                "llama_guard_client must be a LlamaGuardClient or None."
+            )
+
+        self.llama_guard_client = llama_guard_client
+
     def evaluate(
         self,
         *,
@@ -361,6 +406,11 @@ class OutputGuardrailEngine:
         findings.extend(self._check_credential_leak(action_text))
         findings.extend(self._check_topic_drift(action_text, context))
 
+        if self.llama_guard_client is not None:
+            findings = self._apply_llama_guard_confidence_gate(
+                findings, action_text
+            )
+
         highest_severity = None
 
         for finding in findings:
@@ -377,6 +427,80 @@ class OutputGuardrailEngine:
             findings=tuple(findings),
             blocked=blocked,
         )
+
+    def _apply_llama_guard_confidence_gate(
+        self,
+        findings: list[GuardrailFinding],
+        action_text: str,
+    ) -> list[GuardrailFinding]:
+        """
+        Build Phase 29's own confidence gate -- see this module's own
+        top-of-file docstring for the full design. Only ever touches
+        MEDIUM-severity findings; HIGH findings (already confident,
+        deterministic matches) and LOW findings pass through untouched.
+
+        Makes at most ONE real `self.llama_guard_client.classify()`
+        call, regardless of how many MEDIUM findings are present, and
+        applies that single verdict to every one of them. Degrades
+        gracefully -- returning `findings` completely unmodified -- on
+        any exception from that call (an unreachable/misconfigured
+        self-hosted Llama Guard server must never crash or change the
+        outcome of an otherwise-real guardrail evaluation; see this
+        method's own tests for exactly this proof).
+        """
+
+        medium_indices = [
+            index
+            for index, finding in enumerate(findings)
+            if finding.severity == "MEDIUM"
+        ]
+
+        if not medium_indices or not action_text:
+            return findings
+
+        try:
+            verdict = self.llama_guard_client.classify(action_text)
+        except Exception:
+            return findings
+
+        updated = list(findings)
+
+        for index in medium_indices:
+            original = updated[index]
+
+            if verdict.is_safe:
+                updated[index] = GuardrailFinding(
+                    rule=original.rule,
+                    severity="LOW",
+                    detail=(
+                        original.detail
+                        + " Confidence gate: a real, self-hosted Llama "
+                        "Guard classification reviewed this content "
+                        "and found it safe, so this heuristic-only "
+                        "signal is downgraded rather than treated as "
+                        "an unresolved concern."
+                    ),
+                )
+            else:
+                categories = (
+                    ", ".join(verdict.categories)
+                    if verdict.categories
+                    else "unspecified"
+                )
+                updated[index] = GuardrailFinding(
+                    rule=original.rule,
+                    severity="HIGH",
+                    detail=(
+                        original.detail
+                        + " Confidence gate: a real, self-hosted Llama "
+                        "Guard classification independently agreed "
+                        f"this content is unsafe (categories: "
+                        f"{categories}), escalating this from a "
+                        "heuristic-only signal to a confirmed one."
+                    ),
+                )
+
+        return updated
 
     @staticmethod
     def _action_text(action: AgentAction) -> str:
