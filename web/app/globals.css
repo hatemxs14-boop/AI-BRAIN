@@ -1,0 +1,97 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Dark-mode-first palette (the ".dark" class is applied on <html> in
+ * app/layout.tsx unconditionally -- see that file's own comment for
+ * why this project's dashboard defaults to dark rather than following
+ * the OS preference, matching the Vercel/Linear/Cal.com reference
+ * aesthetic this Build Phase's own design brief asked for). Values
+ * follow shadcn/ui's own standard HSL-triplet variable convention
+ * (see tailwind.config.ts) so a real `npx shadcn@latest add <x>` run
+ * later drops components in that already match this palette.
+ */
+@layer base {
+  :root {
+    --background: 240 10% 3.9%;
+    --foreground: 0 0% 98%;
+
+    --card: 240 10% 6%;
+    --card-foreground: 0 0% 98%;
+
+    --primary: 217 91% 60%;
+    --primary-foreground: 0 0% 98%;
+
+    --secondary: 240 4% 16%;
+    --secondary-foreground: 0 0% 98%;
+
+    --muted: 240 4% 16%;
+    --muted-foreground: 240 5% 65%;
+
+    --accent: 240 4% 16%;
+    --accent-foreground: 0 0% 98%;
+
+    --destructive: 0 63% 31%;
+    --destructive-foreground: 0 0% 98%;
+
+    --border: 240 4% 16%;
+    --input: 240 4% 16%;
+    --ring: 217 91% 60%;
+
+    --radius: 0.6rem;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+/*
+ * Build Phase 34: a few small, purely cosmetic touches for the visual
+ * overhaul -- a faint dot-grid backdrop (a common "control panel"
+ * texture in the Linear/Vercel/Cal.com reference family) and a slim,
+ * dark-mode-appropriate scrollbar. Neither affects layout or behavior.
+ */
+body {
+  background-image: radial-gradient(
+    hsl(var(--muted-foreground) / 0.18) 1px,
+    transparent 1px
+  );
+  background-size: 22px 22px;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: hsl(var(--border));
+  border-radius: 999px;
+  border: 2px solid hsl(var(--background));
+}
+
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-in-up {
+  animation: fade-in-up 0.4s ease-out both;
+}
