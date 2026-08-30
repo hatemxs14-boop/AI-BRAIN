@@ -17,6 +17,7 @@ ecc/
 .env
 .env.*
 !.env.example
+!.env.local.example
 
 # Model/provider config (core/llm/model_config.py, Build Phase 18):
 # this file never contains a real API key -- only the *name* of the
