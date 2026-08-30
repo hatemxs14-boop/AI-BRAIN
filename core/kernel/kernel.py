@@ -51,6 +51,10 @@ from core.memory.memory_store import (
     MemoryStore,
 )
 
+from core.observability.langfuse_trace import (
+    TraceRecorder,
+)
+
 from core.orchestration.engine_factory import (
     create_default_orchestration_engine,
 )
@@ -977,6 +981,26 @@ class Kernel:
     this phase; see core/llm/embeddings.py's own module docstring for
     the full rationale.
 
+    `trace_recorder` (Build Phase 32) is an optional core.observability.
+    langfuse_trace.TraceRecorder this Kernel calls exactly once per
+    `run()` call, right before that call returns -- recording the
+    real task, the real final outcome, and the real aggregate token
+    cost (across every attempt and RECOVER IF NEEDED retry) as one
+    observability trace observation. Deliberately, honestly narrower
+    than "every LLM call this Kernel ever makes": this is one
+    end-to-end trace per `run()` call, not a step-by-step trace of
+    every individual decision inside the agent execution loop -- see
+    core/observability/langfuse_trace.py's own module docstring for
+    the full scope rationale. Also deliberately NOT wired into
+    `run_workflow()` or `resume()` in this v1 -- an explicit, stated
+    scope limitation, not a silently-assumed one. Defaults to `None`,
+    in which case `run()` behaves exactly as it did before this phase
+    -- the same opt-in, additive shape every optional Kernel component
+    above already established. Any exception this call raises is
+    caught and discarded by `run()` itself (see that method's own
+    inline comment) -- recording a trace must never prevent a real
+    `Kernel.run()` result from reaching its caller.
+
     `run_multi_agent_workflow`/`resume_multi_agent_workflow` (Build
     Phase 25) chain already-registered agents into a real, compiled
     LangGraph graph (core.orchestration.multi_agent_workflow's
@@ -1003,6 +1027,7 @@ class Kernel:
         token_budget: TokenBudget | None = None,
         model_tier_router: ModelTierRouter | None = None,
         semantic_embedding_client: EmbeddingClient | None = None,
+        trace_recorder: TraceRecorder | None = None,
     ) -> None:
 
         if not isinstance(max_recovery_attempts, int):
@@ -1108,6 +1133,15 @@ class Kernel:
             )
 
         self.semantic_embedding_client = semantic_embedding_client
+
+        if trace_recorder is not None and not isinstance(
+            trace_recorder, TraceRecorder
+        ):
+            raise TypeError(
+                "trace_recorder must be a TraceRecorder or None."
+            )
+
+        self.trace_recorder = trace_recorder
 
     def register_agent(
         self,
@@ -1306,6 +1340,32 @@ class Kernel:
         self._learn(loop_result, verification)
 
         status = self._final_status(loop_result, verification)
+
+        if self.trace_recorder is not None:
+            # Build Phase 32: exactly one observability trace per
+            # run() call, recorded right before returning -- see this
+            # class's own `trace_recorder` docstring paragraph for the
+            # full scope. Deliberately swallows EVERY exception here,
+            # not just ones the real vendor SDK is documented to avoid
+            # raising in the first place: recording a trace must never
+            # be allowed to prevent a real Kernel.run() result from
+            # reaching its caller, no matter what a trace_recorder
+            # implementation does or does not guarantee on its own.
+            try:
+                self.trace_recorder.record_run(
+                    name="kernel_run",
+                    input_text=normalized.text,
+                    output_text=loop_result.reason or "",
+                    status=status,
+                    metadata={
+                        "subject": registration.subject,
+                        "recovery_attempts": recovery_attempts,
+                        "steps": loop_result.steps,
+                    },
+                    usage=token_usage,
+                )
+            except Exception:
+                pass
 
         return KernelResult(
             status=status,

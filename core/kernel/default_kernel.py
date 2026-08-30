@@ -82,6 +82,10 @@ from core.memory.memory_store import (
     MemoryStore,
 )
 
+from core.observability.langfuse_trace import (
+    TraceRecorder,
+)
+
 from core.orchestration.orchestration_engine import (
     OrchestrationEngine,
 )
@@ -430,6 +434,7 @@ def build_default_kernel(
     token_budget: TokenBudget | None = None,
     model_tier_router: ModelTierRouter | None = None,
     semantic_embedding_client: EmbeddingClient | None = None,
+    trace_recorder: TraceRecorder | None = None,
 ) -> Kernel:
     """
     Build a Kernel with research_agent, writer_agent, and
@@ -638,6 +643,17 @@ def build_default_kernel(
     (see Kernel.run()'s own signature), so a Kernel this function
     returns already supports it fully, at the call site, with nothing
     to add here.
+
+    `trace_recorder` (Build Phase 32, default None) is passed straight
+    through to Kernel() exactly like the four parameters immediately
+    above -- the caller constructs a real core.observability.
+    langfuse_trace.TraceRecorder (e.g. via
+    build_langfuse_trace_recorder_factory()()) and passes it in.
+    Defaults to `None`, so every existing caller keeps its exact
+    current behavior unless it explicitly opts in. See Kernel's own
+    `trace_recorder` docstring paragraph for the honest scope: one
+    observability trace per `Kernel.run()` call, not a step-by-step
+    trace of every internal LLM call.
     """
 
     if decision_engine_factory is None:
@@ -750,6 +766,7 @@ def build_default_kernel(
         token_budget=token_budget,
         model_tier_router=model_tier_router,
         semantic_embedding_client=semantic_embedding_client,
+        trace_recorder=trace_recorder,
     )
 
     kernel.register_agent(
