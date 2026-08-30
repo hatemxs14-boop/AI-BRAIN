@@ -46,6 +46,9 @@ from core.agents.agent_loop import AgentLoopResult
 from core.agents.decision_engine import AgentDecisionEngine
 from core.agents.tool_interface import AgentToolInterface
 
+from core.llm.budget import TokenBudget
+from core.llm.token_usage import TokenUsage
+
 from core.orchestration.multi_agent_workflow import (
     MultiAgentWorkflowEngine,
     WorkflowStage,
@@ -116,6 +119,22 @@ class _ImmediateFailEngine(AgentDecisionEngine):
         return AgentAction(
             action_type=AgentActionType.FAIL,
             reason="Deliberately failing this stage.",
+        )
+
+
+class _ImmediateCompleteWithUsageEngine(AgentDecisionEngine):
+    """Same as _ImmediateCompleteEngine, but exposes a fixed
+    `total_usage` -- the same duck-typed attribute a real
+    LLMDecisionEngine exposes -- so a stage's own `token_budget` (Build
+    Phase 26) has something real to check."""
+
+    def __init__(self, usage: TokenUsage) -> None:
+        self.total_usage = usage
+
+    def decide(self, context):
+        return AgentAction(
+            action_type=AgentActionType.COMPLETE,
+            reason="Stage work done.",
         )
 
 
@@ -220,6 +239,16 @@ def test_workflow_stage_rejects_non_bool_requires_human_approval(tmp_dir):
         )
 
 
+def test_workflow_stage_rejects_non_token_budget(tmp_dir):
+    with pytest.raises(TypeError, match="token_budget"):
+        WorkflowStage(
+            name="research",
+            build_agent=lambda: _build_zero_tool_agent(tmp_dir, "a"),
+            build_decision_engine=_ImmediateCompleteEngine,
+            token_budget="not-a-token-budget",
+        )
+
+
 def test_workflow_stage_accepts_valid_minimal_definition(tmp_dir):
     stage = WorkflowStage(
         name="research",
@@ -230,6 +259,20 @@ def test_workflow_stage_accepts_valid_minimal_definition(tmp_dir):
     assert stage.name == "research"
     assert stage.max_steps == 10
     assert stage.requires_human_approval is False
+    assert stage.token_budget is None
+
+
+def test_workflow_stage_accepts_a_valid_token_budget(tmp_dir):
+    budget = TokenBudget(max_total_tokens=500)
+
+    stage = WorkflowStage(
+        name="research",
+        build_agent=lambda: _build_zero_tool_agent(tmp_dir, "a"),
+        build_decision_engine=_ImmediateCompleteEngine,
+        token_budget=budget,
+    )
+
+    assert stage.token_budget is budget
 
 
 def test_engine_rejects_non_sequence_stages():
@@ -346,6 +389,43 @@ def test_workflow_halts_when_a_stage_fails_and_never_runs_later_stages(tmp_dir):
     result = engine.run(task="Research AI agents", thread_id="thread-2")
 
     assert result.status == "HALTED"
+    assert "research" in result.halt_reason
+    assert len(result.stage_results) == 1
+    assert writer_calls == []
+
+
+def test_workflow_halts_when_a_stages_own_token_budget_is_exceeded(tmp_dir):
+    # Build Phase 26: a stage's own token_budget stops IT the exact
+    # same way a FAILED stage already does above -- the workflow halts
+    # right there and never reaches a later stage, even though the
+    # over-budget stage's own AgentAction would otherwise have
+    # completed cleanly.
+    pytest.importorskip("langgraph")
+
+    over_budget_usage = TokenUsage(
+        prompt_tokens=100, completion_tokens=50, total_tokens=150
+    )
+    research = WorkflowStage(
+        name="research",
+        build_agent=lambda: _build_zero_tool_agent(tmp_dir, "research"),
+        build_decision_engine=lambda: _ImmediateCompleteWithUsageEngine(
+            over_budget_usage
+        ),
+        token_budget=TokenBudget(max_total_tokens=100),
+    )
+    writer_calls: list = []
+    writer = WorkflowStage(
+        name="writer",
+        build_agent=lambda: _build_zero_tool_agent(tmp_dir, "writer"),
+        build_decision_engine=lambda: _ImmediateCompleteEngine(writer_calls),
+    )
+
+    engine = MultiAgentWorkflowEngine([research, writer])
+
+    result = engine.run(task="Research AI agents", thread_id="thread-budget")
+
+    assert result.status == "HALTED"
+    assert result.stage_results[0].status == "BUDGET_EXCEEDED"
     assert "research" in result.halt_reason
     assert len(result.stage_results) == 1
     assert writer_calls == []

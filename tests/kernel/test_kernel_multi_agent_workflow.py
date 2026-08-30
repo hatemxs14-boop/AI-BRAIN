@@ -34,6 +34,9 @@ from core.agents.tool_interface import AgentToolInterface
 
 from core.kernel.kernel import AgentRegistration, Kernel
 
+from core.llm.budget import TokenBudget
+from core.llm.token_usage import TokenUsage
+
 from core.orchestration.orchestration_engine import (
     SequentialOrchestrationEngine,
 )
@@ -144,6 +147,23 @@ class _CredentialLeakEngine(AgentDecisionEngine):
         )
 
 
+class _OverBudgetEngine(AgentDecisionEngine):
+    """Completes cleanly, but exposes a `total_usage` already past any
+    reasonably small TokenBudget -- the same duck-typed attribute a
+    real LLMDecisionEngine exposes after a real call."""
+
+    def __init__(self) -> None:
+        self.total_usage = TokenUsage(
+            prompt_tokens=100, completion_tokens=50, total_tokens=150
+        )
+
+    def decide(self, context: AgentContext) -> AgentAction:
+        return AgentAction(
+            action_type=AgentActionType.COMPLETE,
+            reason="Stage work done (but over budget).",
+        )
+
+
 @pytest.fixture()
 def tmp_dir():
     directory = Path(tempfile.mkdtemp())
@@ -157,11 +177,13 @@ def _kernel_with_two_registered_agents(
     tmp_dir: Path,
     *,
     guardrail_engine: OutputGuardrailEngine | None = None,
+    token_budget: TokenBudget | None = None,
     second_engine: type[AgentDecisionEngine] = _ImmediateCompleteEngine,
 ) -> Kernel:
     kernel = Kernel(
         orchestration_engine=SequentialOrchestrationEngine(),
         guardrail_engine=guardrail_engine,
+        token_budget=token_budget,
     )
 
     kernel.register_agent(
@@ -377,6 +399,50 @@ def test_kernel_without_guardrail_engine_leaves_stages_unguarded(tmp_dir):
         subjects=("research_agent", "writer_agent"),
         task="Research AI agents",
         thread_id="thread-k6",
+    )
+
+    assert result.status == "COMPLETED"
+    assert len(result.stage_results) == 2
+
+
+def test_kernels_token_budget_is_threaded_into_every_stage(tmp_dir):
+    pytest.importorskip("langgraph")
+
+    kernel = _kernel_with_two_registered_agents(
+        tmp_dir,
+        token_budget=TokenBudget(max_total_tokens=100),
+        second_engine=_OverBudgetEngine,
+    )
+
+    result = kernel.run_multi_agent_workflow(
+        subjects=("research_agent", "writer_agent"),
+        task="Research AI agents",
+        thread_id="thread-k7",
+    )
+
+    # Stage one (research_agent) completes cleanly with no usage at
+    # all reported (_ImmediateCompleteEngine exposes none); stage two
+    # (writer_agent) reports usage past the Kernel's own token_budget
+    # -- threaded into every stage -- and must be blocked there, the
+    # same way it would a single-agent run.
+    assert result.status == "HALTED"
+    assert len(result.stage_results) == 2
+    assert result.stage_results[0].status == "COMPLETED"
+    assert result.stage_results[1].status == "BUDGET_EXCEEDED"
+
+
+def test_kernel_without_token_budget_leaves_stages_uncapped(tmp_dir):
+    pytest.importorskip("langgraph")
+
+    kernel = _kernel_with_two_registered_agents(
+        tmp_dir,
+        second_engine=_OverBudgetEngine,
+    )
+
+    result = kernel.run_multi_agent_workflow(
+        subjects=("research_agent", "writer_agent"),
+        task="Research AI agents",
+        thread_id="thread-k8",
     )
 
     assert result.status == "COMPLETED"

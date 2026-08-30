@@ -14,6 +14,8 @@ from core.agents.decision_engine import AgentDecisionEngine
 
 from core.agents.guardrails import OutputGuardrailEngine
 
+from core.llm.budget import TokenBudget
+
 
 # ---------------------------------------------------------------------
 # Build Phase 24 -- real multi-agent workflows on top of LangGraph.
@@ -88,9 +90,11 @@ from core.agents.guardrails import OutputGuardrailEngine
 # WorkflowStage.guardrail_engine (see that field's own docstring) --
 # exactly mirroring how Kernel._execute_once() threads the same
 # guardrail_engine into a single agent's own AgentExecutionLoop.
+# Build Phase 26 threads the Kernel's own `token_budget` the same way,
+# via WorkflowStage.token_budget -- same mirroring, same call site.
 # Kernel still does NOT thread checkpoint_store into a multi-agent
 # workflow's own stages -- a deliberately narrower scope boundary than
-# even guardrail_engine's, left for a future phase.
+# even guardrail_engine's/token_budget's, left for a future phase.
 # ---------------------------------------------------------------------
 
 
@@ -172,6 +176,20 @@ class WorkflowStage:
     no such concept in this engine yet.
     """
 
+    token_budget: TokenBudget | None = None
+    """
+    Optional, per-stage (Build Phase 26; Kernel.run_multi_agent_
+    workflow() passes the Kernel's own `self.token_budget` here for
+    every stage it builds, exactly mirroring how it already passes
+    `self.guardrail_engine` above). `None` by default: a stage built
+    directly (not through the Kernel) has no token budget unless
+    explicitly given one, the same opt-in convention every other
+    optional component in this project follows. Each stage's own
+    AgentExecutionLoop tracks its own usage independently -- a budget
+    here caps ONE stage's own spend, not the workflow's cumulative
+    total across every stage that has already run.
+    """
+
     def __post_init__(self) -> None:
 
         if not isinstance(self.name, str) or not self.name.strip():
@@ -218,6 +236,14 @@ class WorkflowStage:
             raise TypeError(
                 "WorkflowStage.guardrail_engine must be an "
                 "OutputGuardrailEngine or None."
+            )
+
+        if self.token_budget is not None and not isinstance(
+            self.token_budget, TokenBudget
+        ):
+            raise TypeError(
+                "WorkflowStage.token_budget must be a TokenBudget "
+                "or None."
             )
 
 
@@ -282,6 +308,7 @@ def _make_stage_node(stage: WorkflowStage):
             decision_engine=decision_engine,
             max_steps=stage.max_steps,
             guardrail_engine=stage.guardrail_engine,
+            token_budget=stage.token_budget,
         )
 
         result = loop.run()

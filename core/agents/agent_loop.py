@@ -34,6 +34,10 @@ from core.agents.guardrails import (
     OutputGuardrailEngine,
 )
 
+from core.llm.budget import (
+    TokenBudget,
+)
+
 from core.llm.token_usage import (
     TokenUsage,
 )
@@ -131,6 +135,7 @@ class AgentExecutionLoop:
         checkpoint_id: str | None = None,
         resume_from: TaskCheckpoint | None = None,
         guardrail_engine: OutputGuardrailEngine | None = None,
+        token_budget: TokenBudget | None = None,
     ) -> None:
         """
         `checkpoint_store`/`checkpoint_id`/`resume_from` (Build Phase
@@ -148,6 +153,13 @@ class AgentExecutionLoop:
         `run()`'s own docstring for exactly where it is consulted, and
         core/agents/guardrails.py's own module docstring for what it
         checks and why it defaults to flagging rather than blocking.
+
+        `token_budget` (Build Phase 26) is entirely optional and
+        independent of every other parameter above -- see `run()`'s
+        own docstring for exactly where it is consulted, and
+        core/llm/budget.py's own module docstring for what it checks,
+        why (unlike `guardrail_engine`) it always enforces once
+        configured, and why it can only ever be a reactive check.
         """
 
         if not isinstance(
@@ -246,6 +258,15 @@ class AgentExecutionLoop:
         self.guardrail_engine = guardrail_engine
         self._guardrail_findings: list[GuardrailFinding] = []
 
+        if token_budget is not None and not isinstance(
+            token_budget, TokenBudget
+        ):
+            raise TypeError(
+                "token_budget must be a TokenBudget."
+            )
+
+        self.token_budget = token_budget
+
         self.context: AgentContext | None = None
 
     def run(
@@ -267,6 +288,26 @@ class AgentExecutionLoop:
         INVALID_ACTION's own shape: `self.agent.fail_task()` is called,
         the step is never counted (this check runs before `steps` is
         incremented), and the action is never executed.
+
+        Build Phase 26: when `self.token_budget` is configured, it is
+        checked immediately after the guardrail check above (same
+        "after validation, before execution, before `steps` is
+        incremented" position) against
+        `self.decision_engine.total_usage` -- the SAME real,
+        cumulative usage `_build_result` itself reads, duck-typed via
+        `getattr(..., None)` so an action-provider-driven loop or a
+        decision engine that exposes no usage never raises, it simply
+        never trips this check (see TokenBudget.exceeded_by's own
+        docstring: `usage=None` always means "not exceeded," never a
+        fabricated violation). This can only be a REACTIVE check --
+        the tokens for the LLM call that just happened are already
+        spent and already billed by the time `total_usage` reflects
+        them -- so a configured budget stops every FURTHER step once
+        the ceiling is reached, but honestly cannot prevent the one
+        call that crosses it. Once tripped, this returns a new
+        terminal status ("BUDGET_EXCEEDED") via the exact same shape
+        as GUARDRAIL_BLOCKED: `self.agent.fail_task()`, the step
+        uncounted, the action never executed.
         """
 
         task = getattr(
@@ -423,6 +464,31 @@ class AgentExecutionLoop:
                         reason=(
                             "Blocked by output guardrails before "
                             f"execution: {blocking_findings}"
+                        ),
+                    )
+
+            if self.token_budget is not None:
+
+                current_usage = getattr(
+                    self.decision_engine,
+                    "total_usage",
+                    None,
+                )
+
+                if self.token_budget.exceeded_by(current_usage):
+
+                    self.agent.fail_task()
+
+                    return self._build_result(
+                        status="BUDGET_EXCEEDED",
+                        steps=steps,
+                        last_result=last_result,
+                        reason=(
+                            "Blocked before execution: token budget "
+                            f"of {self.token_budget.max_total_tokens} "
+                            "total tokens has been reached or "
+                            f"exceeded (current: "
+                            f"{current_usage.total_tokens if current_usage is not None else 'unknown'})."
                         ),
                     )
 

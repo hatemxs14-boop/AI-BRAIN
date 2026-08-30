@@ -25,6 +25,10 @@ from core.agents.guardrails import (
     OutputGuardrailEngine,
 )
 
+from core.llm.budget import (
+    TokenBudget,
+)
+
 from core.llm.token_usage import (
     TokenUsage,
     combine_token_usage,
@@ -887,6 +891,19 @@ class Kernel:
     either concern to cover that secondary, optional run is future
     work, not a silently-assumed part of this phase.
 
+    `token_budget` (Build Phase 26) is an optional core.llm.budget.
+    TokenBudget this Kernel threads through to every AgentExecutionLoop
+    it drives for the PRIMARY task-executing agent -- exactly the same
+    scope `guardrail_engine` (Build Phase 23) already established
+    immediately above, right down to the same honest exclusion of a
+    triggered `_trigger_independent_verification` run. Defaults to
+    `None`, in which case AgentExecutionLoop is built with no token
+    budget at all and behaves exactly as it did before this phase --
+    the same opt-in, additive shape every optional Kernel component
+    already established. See core/llm/budget.py's own module docstring
+    for why, unlike `guardrail_engine`, a configured `token_budget`
+    always enforces (there is no separate "observe only" mode for it).
+
     `run_multi_agent_workflow`/`resume_multi_agent_workflow` (Build
     Phase 25) chain already-registered agents into a real, compiled
     LangGraph graph (core.orchestration.multi_agent_workflow's
@@ -910,6 +927,7 @@ class Kernel:
         memory_store: MemoryStore | None = None,
         context_retrieval_limit: int = 5,
         guardrail_engine: OutputGuardrailEngine | None = None,
+        token_budget: TokenBudget | None = None,
     ) -> None:
 
         if not isinstance(max_recovery_attempts, int):
@@ -987,6 +1005,15 @@ class Kernel:
             )
 
         self.guardrail_engine = guardrail_engine
+
+        if token_budget is not None and not isinstance(
+            token_budget, TokenBudget
+        ):
+            raise TypeError(
+                "token_budget must be a TokenBudget or None."
+            )
+
+        self.token_budget = token_budget
 
     def register_agent(
         self,
@@ -1288,6 +1315,7 @@ class Kernel:
             checkpoint_store=checkpoint_store,
             checkpoint_id=checkpoint.checkpoint_id,
             guardrail_engine=self.guardrail_engine,
+            token_budget=self.token_budget,
         )
 
         loop_result = loop.run()
@@ -1567,10 +1595,10 @@ class Kernel:
         from this mapping (or the mapping itself omitted) never pauses.
 
         Every stage built here is threaded with this Kernel's own
-        `self.guardrail_engine` (Build Phase 23), exactly mirroring how
-        `_execute_once` threads it into a single agent's own
-        AgentExecutionLoop -- `None` unless this Kernel was itself
-        constructed with one.
+        `self.guardrail_engine` (Build Phase 23) and `self.token_budget`
+        (Build Phase 26), exactly mirroring how `_execute_once` threads
+        both into a single agent's own AgentExecutionLoop -- `None`
+        unless this Kernel was itself constructed with one.
 
         Deliberately narrower than Kernel.run(): no NORMALIZE/CLASSIFY/
         context-retrieval/policy-evaluation/independent-verification
@@ -1707,6 +1735,7 @@ class Kernel:
                         approval_gates.get(subject, False)
                     ),
                     guardrail_engine=self.guardrail_engine,
+                    token_budget=self.token_budget,
                 )
             )
 
@@ -1768,21 +1797,23 @@ class Kernel:
         for the distinction between the two).
 
         When `checkpoint_store` is given, OR when this Kernel was
-        constructed with a `guardrail_engine` (Build Phase 23), this
-        bypasses the pluggable OrchestrationEngine seam and drives
-        AgentExecutionLoop directly instead -- the exact same call
-        SequentialOrchestrationEngine.run() itself makes internally --
-        so this attempt's progress can be checkpointed and/or its
-        decisions guardrail-checked. See checkpoint.py's and
-        guardrails.py's own module docstrings for why this
-        deliberately does not (yet) flow through
-        LangGraphOrchestrationEngine: threading either concern through
-        that engine too would require changing code this sandbox
-        cannot install or execute even once (no PyPI access), and
-        shipping an unverified change to it would break this project's
-        own "nothing is done until a real pytest run confirms it"
-        rule -- the same reasoning already applied at Build Phases 4,
-        18, 21, and 22 for this exact untestable file.
+        constructed with a `guardrail_engine` (Build Phase 23), OR when
+        this Kernel was constructed with a `token_budget` (Build Phase
+        26), this bypasses the pluggable OrchestrationEngine seam and
+        drives AgentExecutionLoop directly instead -- the exact same
+        call SequentialOrchestrationEngine.run() itself makes
+        internally -- so this attempt's progress can be checkpointed
+        and/or its decisions guardrail-checked and/or its spend
+        budget-capped. See checkpoint.py's, guardrails.py's, and
+        budget.py's own module docstrings for why this deliberately
+        does not (yet) flow through LangGraphOrchestrationEngine:
+        threading any of these concerns through that engine too would
+        require changing code this sandbox cannot install or execute
+        even once (no PyPI access), and shipping an unverified change
+        to it would break this project's own "nothing is done until a
+        real pytest run confirms it" rule -- the same reasoning
+        already applied at Build Phases 4, 18, 21, 22, and 23 for this
+        exact untestable file.
         """
 
         plan = self._plan(
@@ -1793,7 +1824,11 @@ class Kernel:
 
         plan.agent.start_task(normalized.text)
 
-        if checkpoint_store is not None or self.guardrail_engine is not None:
+        if (
+            checkpoint_store is not None
+            or self.guardrail_engine is not None
+            or self.token_budget is not None
+        ):
 
             loop = AgentExecutionLoop(
                 agent=plan.agent,
@@ -1802,6 +1837,7 @@ class Kernel:
                 checkpoint_store=checkpoint_store,
                 checkpoint_id=checkpoint_id,
                 guardrail_engine=self.guardrail_engine,
+                token_budget=self.token_budget,
             )
 
             return loop.run()
