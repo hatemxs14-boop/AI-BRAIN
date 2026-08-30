@@ -30,11 +30,16 @@ from core.agents.agent_context import AgentContext
 from core.agents.agent_core import AgentCore, AgentIdentity
 from core.agents.decision_engine import AgentDecisionEngine
 from core.agents.guardrails import OutputGuardrailEngine
+from core.agents.llm_decision_engine import LLMDecisionEngine
 from core.agents.tool_interface import AgentToolInterface
 
 from core.kernel.kernel import AgentRegistration, Kernel
 
 from core.llm.budget import TokenBudget
+from core.llm.llm_client import LLMClient
+from core.llm.llm_request import LLMRequest
+from core.llm.llm_response import LLMResponse
+from core.llm.model_tier import ModelTierRouter
 from core.llm.token_usage import TokenUsage
 
 from core.orchestration.orchestration_engine import (
@@ -161,6 +166,32 @@ class _OverBudgetEngine(AgentDecisionEngine):
         return AgentAction(
             action_type=AgentActionType.COMPLETE,
             reason="Stage work done (but over budget).",
+        )
+
+
+class _RecordingLLMClient(LLMClient):
+    """
+    Build Phase 27: a minimal, real LLMClient that records the last
+    LLMRequest it was asked to `generate()` -- specifically its own
+    `.model` field -- so a test can confirm which model tier the
+    Kernel's own `model_tier_router` actually routed a given stage's
+    task to. Mirrors tests/agents/test_llm_decision_engine.py's own
+    MockLLMClient.
+    """
+
+    def __init__(self) -> None:
+        self.last_request: LLMRequest | None = None
+
+    def generate(self, request: LLMRequest) -> LLMResponse:
+        self.last_request = request
+        return LLMResponse(
+            content=(
+                '{"action_type":"COMPLETE","tool_id":null,'
+                '"inputs":null,"reason":"Stage work done."}'
+            ),
+            model=request.model or "unspecified",
+            finish_reason="stop",
+            usage=None,
         )
 
 
@@ -447,3 +478,109 @@ def test_kernel_without_token_budget_leaves_stages_uncapped(tmp_dir):
 
     assert result.status == "COMPLETED"
     assert len(result.stage_results) == 2
+
+
+def _kernel_with_two_llm_backed_agents(
+    tmp_dir: Path,
+    *,
+    research_client: _RecordingLLMClient,
+    writer_client: _RecordingLLMClient,
+    model_tier_router: ModelTierRouter | None = None,
+) -> Kernel:
+    kernel = Kernel(
+        orchestration_engine=SequentialOrchestrationEngine(),
+        model_tier_router=model_tier_router,
+    )
+
+    kernel.register_agent(
+        AgentRegistration(
+            subject="research_agent",
+            description="First stage.",
+            can_handle=lambda normalized: True,
+            build_agent=lambda: _build_low_risk_tool_agent(
+                tmp_dir, "research_agent"
+            ),
+            build_decision_engine=lambda: LLMDecisionEngine(
+                research_client, model="default-model"
+            ),
+        )
+    )
+
+    kernel.register_agent(
+        AgentRegistration(
+            subject="writer_agent",
+            description="Second stage.",
+            can_handle=lambda normalized: False,
+            build_agent=lambda: _build_low_risk_tool_agent(
+                tmp_dir, "writer_agent"
+            ),
+            build_decision_engine=lambda: LLMDecisionEngine(
+                writer_client, model="default-model"
+            ),
+        )
+    )
+
+    return kernel
+
+
+def test_kernels_model_tier_router_is_threaded_into_every_stage(tmp_dir):
+    pytest.importorskip("langgraph")
+
+    research_client = _RecordingLLMClient()
+    writer_client = _RecordingLLMClient()
+
+    kernel = _kernel_with_two_llm_backed_agents(
+        tmp_dir,
+        research_client=research_client,
+        writer_client=writer_client,
+        model_tier_router=ModelTierRouter(
+            simple_model="cheap-model",
+            complex_model="expensive-model",
+        ),
+    )
+
+    # The word "comprehensive" is a complexity-signal keyword, so both
+    # stages' own task text (research_agent's is the original task
+    # verbatim; writer_agent's is the original task plus prior-stage
+    # context, per _default_task_template -- still containing the same
+    # keyword) route to the complex tier, regardless of exact word
+    # count -- a deterministic way to prove the SAME router reaches
+    # BOTH stages without depending on word-count arithmetic across
+    # the context-template boundary.
+    result = kernel.run_multi_agent_workflow(
+        subjects=("research_agent", "writer_agent"),
+        task="Please provide a comprehensive analysis of AI agents.",
+        thread_id="thread-k9",
+    )
+
+    assert result.status == "COMPLETED"
+    assert len(result.stage_results) == 2
+    assert research_client.last_request is not None
+    assert research_client.last_request.model == "expensive-model"
+    assert writer_client.last_request is not None
+    assert writer_client.last_request.model == "expensive-model"
+
+
+def test_kernel_without_model_tier_router_leaves_stage_models_unchanged(tmp_dir):
+    pytest.importorskip("langgraph")
+
+    research_client = _RecordingLLMClient()
+    writer_client = _RecordingLLMClient()
+
+    kernel = _kernel_with_two_llm_backed_agents(
+        tmp_dir,
+        research_client=research_client,
+        writer_client=writer_client,
+    )
+
+    result = kernel.run_multi_agent_workflow(
+        subjects=("research_agent", "writer_agent"),
+        task="Please provide a comprehensive analysis of AI agents.",
+        thread_id="thread-k10",
+    )
+
+    assert result.status == "COMPLETED"
+    assert research_client.last_request is not None
+    assert research_client.last_request.model == "default-model"
+    assert writer_client.last_request is not None
+    assert writer_client.last_request.model == "default-model"

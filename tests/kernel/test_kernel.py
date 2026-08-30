@@ -35,6 +35,8 @@ from core.kernel.kernel import (
     WorkflowVerifierRegistration,
 )
 
+from core.llm.embeddings import EmbeddingClient
+
 from core.memory.memory_store import MemoryEntry, MemoryStore
 
 from core.orchestration.orchestration_engine import (
@@ -1739,5 +1741,270 @@ def test_context_retrieval_limit_is_passed_through_to_search():
         kernel.run("Do something trivial.")
 
         assert captured["limit"] == 3
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------
+# Kernel(semantic_embedding_client=...) (Build Phase 28)
+#
+# A fake, in-process EmbeddingClient double keyed by exact text ->
+# vector, never a real network call -- same convention tests/llm/
+# test_embeddings.py's own _FakeVoyageVendorClient and tests/memory/
+# test_memory_store.py's own _FakeEmbeddingClient already establish.
+# ---------------------------------------------------------------------
+
+
+class _FakeEmbeddingClient(EmbeddingClient):
+    def __init__(self, vectors: dict) -> None:
+        self._vectors = vectors
+
+    def embed(self, texts, *, input_type):
+        return tuple(self._vectors[text] for text in texts)
+
+
+def test_kernel_rejects_a_non_embedding_client():
+    with pytest.raises(TypeError, match="semantic_embedding_client"):
+        Kernel(
+            orchestration_engine=SequentialOrchestrationEngine(),
+            semantic_embedding_client="not-an-embedding-client",
+        )
+
+
+def test_kernel_defaults_to_no_semantic_embedding_client():
+    kernel = Kernel(orchestration_engine=SequentialOrchestrationEngine())
+    assert kernel.semantic_embedding_client is None
+
+
+def test_semantic_embedding_client_is_a_noop_when_memory_store_is_none():
+    # Meaningless without a memory_store -- must not error, must not
+    # change behavior at all, the same tolerant shape guardrail_engine/
+    # token_budget/model_tier_router already established for a
+    # configured-but-inapplicable optional component.
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        kernel = Kernel(
+            orchestration_engine=SequentialOrchestrationEngine(),
+            semantic_embedding_client=_FakeEmbeddingClient({}),
+        )
+
+        kernel.register_agent(
+            AgentRegistration(
+                subject="test_agent",
+                description="Completes immediately.",
+                can_handle=lambda normalized: True,
+                build_agent=lambda: _build_zero_tool_agent(tmp_dir),
+                build_decision_engine=lambda: _ImmediateCompleteEngine(),
+            )
+        )
+
+        result = kernel.run("Do something trivial.")
+
+        assert result.status == "COMPLETED"
+        assert result.retrieved_context is None
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_retrieve_context_uses_real_semantic_ranking_when_configured():
+    """
+    Genuine-delegation proof that semantic search actually changes
+    what's retrieved vs. plain keyword search: the memory record below
+    shares NO keyword token with the task text (so plain search()
+    would return nothing for it), but the fake embedding client gives
+    it the same direction as the query vector, so search_semantic()
+    -- and therefore _retrieve_context when semantic_embedding_client
+    is configured -- surfaces it anyway.
+    """
+
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        store = MemoryStore(str(tmp_dir / "memory.jsonl"))
+        record = store.write(
+            MemoryEntry(
+                subject="research_agent",
+                kind="note",
+                content="The vehicle is out of fuel.",
+            )
+        )
+
+        # Sanity check: plain keyword search genuinely finds nothing
+        # for this task -- proves the semantic path below is doing
+        # real, additional work, not just duplicating search().
+        assert store.search("Need gas for automobile") == ()
+
+        client = _FakeEmbeddingClient(
+            {
+                "Need gas for automobile": (1.0, 0.0),
+                "The vehicle is out of fuel.": (1.0, 0.0),
+            }
+        )
+
+        kernel = Kernel(
+            orchestration_engine=SequentialOrchestrationEngine(),
+            memory_store=store,
+            semantic_embedding_client=client,
+        )
+
+        kernel.register_agent(
+            AgentRegistration(
+                subject="test_agent",
+                description="Completes immediately.",
+                can_handle=lambda normalized: True,
+                build_agent=lambda: _build_zero_tool_agent(tmp_dir),
+                build_decision_engine=lambda: _ImmediateCompleteEngine(),
+            )
+        )
+
+        result = kernel.run("Need gas for automobile")
+
+        assert result.status == "COMPLETED"
+        assert result.retrieved_context is not None
+        assert len(result.retrieved_context.records) == 1
+        assert result.retrieved_context.records[0].id == record.id
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_retrieve_context_degrades_to_none_when_search_semantic_raises_value_error():
+    class _AlwaysValueErrorMemoryStore(MemoryStore):
+        def search_semantic(self, *args, **kwargs):
+            raise ValueError("simulated empty query")
+
+        def search(self, *args, **kwargs):
+            raise AssertionError(
+                "plain search() must not be called on a ValueError from "
+                "search_semantic() -- that must degrade straight to None."
+            )
+
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        kernel = Kernel(
+            orchestration_engine=SequentialOrchestrationEngine(),
+            memory_store=_AlwaysValueErrorMemoryStore(
+                str(tmp_dir / "memory.jsonl")
+            ),
+            semantic_embedding_client=_FakeEmbeddingClient({}),
+        )
+
+        kernel.register_agent(
+            AgentRegistration(
+                subject="test_agent",
+                description="Completes immediately.",
+                can_handle=lambda normalized: True,
+                build_agent=lambda: _build_zero_tool_agent(tmp_dir),
+                build_decision_engine=lambda: _ImmediateCompleteEngine(),
+            )
+        )
+
+        result = kernel.run("Do something trivial.")
+
+        assert result.status == "COMPLETED"
+        assert result.retrieved_context is None
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_retrieve_context_falls_back_to_keyword_search_when_search_semantic_raises():
+    """
+    A real embeddings-API failure (anything other than ValueError --
+    e.g. a network error or EmbeddingConfigError) must not lose all
+    retrieved context: _retrieve_context falls through to the plain
+    keyword search() call instead of giving up, since a working,
+    zero-marginal-cost fallback is already available.
+    """
+
+    class _AlwaysBrokenSemanticSearchMemoryStore(MemoryStore):
+        def search_semantic(self, *args, **kwargs):
+            raise RuntimeError("simulated embeddings API outage")
+
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        store = _AlwaysBrokenSemanticSearchMemoryStore(
+            str(tmp_dir / "memory.jsonl")
+        )
+        store.write(
+            MemoryEntry(
+                subject="research_agent",
+                kind="note",
+                content="The quarterly report is finished.",
+            )
+        )
+
+        kernel = Kernel(
+            orchestration_engine=SequentialOrchestrationEngine(),
+            memory_store=store,
+            semantic_embedding_client=_FakeEmbeddingClient({}),
+        )
+
+        kernel.register_agent(
+            AgentRegistration(
+                subject="test_agent",
+                description="Completes immediately.",
+                can_handle=lambda normalized: True,
+                build_agent=lambda: _build_zero_tool_agent(tmp_dir),
+                build_decision_engine=lambda: _ImmediateCompleteEngine(),
+            )
+        )
+
+        result = kernel.run("Please summarize the quarterly report.")
+
+        assert result.status == "COMPLETED"
+        assert result.retrieved_context is not None
+        assert len(result.retrieved_context.records) == 1
+        assert result.retrieved_context.records[0].content == (
+            "The quarterly report is finished."
+        )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_retrieve_context_uses_plain_search_when_no_semantic_embedding_client():
+    """
+    A memory_store configured WITHOUT a semantic_embedding_client must
+    keep using plain search() only -- search_semantic() must never be
+    called -- exactly the pre-Build-Phase-28 behavior.
+    """
+
+    class _SearchSemanticMustNotBeCalledMemoryStore(MemoryStore):
+        def search_semantic(self, *args, **kwargs):
+            raise AssertionError(
+                "search_semantic() must not be called when no "
+                "semantic_embedding_client is configured."
+            )
+
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        store = _SearchSemanticMustNotBeCalledMemoryStore(
+            str(tmp_dir / "memory.jsonl")
+        )
+        store.write(
+            MemoryEntry(
+                subject="research_agent",
+                kind="note",
+                content="The quarterly report is finished.",
+            )
+        )
+
+        kernel = Kernel(
+            orchestration_engine=SequentialOrchestrationEngine(),
+            memory_store=store,
+        )
+
+        kernel.register_agent(
+            AgentRegistration(
+                subject="test_agent",
+                description="Completes immediately.",
+                can_handle=lambda normalized: True,
+                build_agent=lambda: _build_zero_tool_agent(tmp_dir),
+                build_decision_engine=lambda: _ImmediateCompleteEngine(),
+            )
+        )
+
+        result = kernel.run("Please summarize the quarterly report.")
+
+        assert result.status == "COMPLETED"
+        assert result.retrieved_context is not None
+        assert len(result.retrieved_context.records) == 1
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)

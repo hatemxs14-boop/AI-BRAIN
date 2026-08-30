@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from core.llm.embeddings import EmbeddingClient, cosine_similarity
+
 
 # ---------------------------------------------------------------------
 # Build Phase 14: the real (v1) Memory Layer described in
@@ -22,6 +24,16 @@ from pathlib import Path
 # deliberately narrow (keyword search, not a fabricated "semantic"
 # layer -- see MEMORY_SPEC.md's own v1 Scope section for exactly what
 # is and isn't built yet).
+#
+# Build Phase 28 adds search_semantic() alongside search() below -- a
+# NEW, separate, opt-in method using real Voyage AI embeddings
+# (core/llm/embeddings.py) and cosine similarity, not a replacement of
+# search()'s own keyword matching. search() itself, its signature, and
+# every existing caller's behavior are completely unchanged by this --
+# the same "purely additive, opt-in" shape every prior Build Phase in
+# this project already established. See search_semantic()'s own
+# docstring for its honest v1 scope (no persisted/cached embeddings
+# yet -- every call re-embeds every candidate record's content).
 #
 # Shape mirrors core/security/engine/audit_logger.py's own
 # AuditLogger deliberately (append-only JSON Lines, a timestamp
@@ -350,6 +362,114 @@ class MemoryStore:
         ]
 
         return tuple(matches[:limit])
+
+    def search_semantic(
+        self,
+        query: str,
+        *,
+        embedding_client: EmbeddingClient,
+        subject: str | None = None,
+        verified_only: bool = False,
+        limit: int = 10,
+        min_similarity: float = 0.0,
+    ) -> tuple[MemoryRecord, ...]:
+        """
+        Build Phase 28: real semantic search, ranking candidate records
+        by embedding cosine similarity to `query` rather than by
+        keyword/substring overlap. A NEW, separate, opt-in method --
+        see this module's own top-of-file docstring for why `search()`
+        itself is completely unchanged.
+
+        `subject`/`verified_only` filter the candidate pool exactly
+        like `search()`'s own identically-named parameters, applied
+        BEFORE any embedding call is made (so a filter that empties
+        the candidate pool costs nothing -- no embedding call is made
+        at all when there is nothing left to rank; see the empty-pool
+        short-circuit below).
+
+        Ranks by descending cosine similarity to the query and returns
+        at most `limit` records; `min_similarity` (default 0.0, i.e.
+        no threshold) drops any record scoring below it, exactly like
+        `search()`'s own `limit` truncates rather than errors when
+        fewer than `limit` records qualify.
+
+        Embeds the query and the candidate pool with Voyage AI's own
+        documented asymmetric `input_type` distinction ("query" for
+        `query` itself, "document" for every candidate's own content)
+        -- see core/llm/embeddings.py's own EmbeddingClient.embed()
+        docstring for why this measurably improves retrieval quality
+        over embedding both sides the same way. Exactly two real
+        `embedding_client.embed()` calls per invocation regardless of
+        candidate-pool size (one for the query, one batched call for
+        every surviving candidate's content) -- never one call per
+        record.
+
+        Honest v1 scope, worth knowing: unlike a production vector-
+        search system, this method does NOT persist or cache any
+        record's embedding -- every single call re-embeds every
+        surviving candidate's own content from scratch. This mirrors
+        this whole module's own "real but deliberately narrow v1"
+        precedent (see MEMORY_SPEC.md's v1 Scope section) rather than
+        silently claiming a persisted-index-backed system this project
+        does not actually have. For today's expected memory-store
+        sizes this is a real, working v1; a future phase adding a
+        persisted embedding cache alongside each record is left as
+        explicitly open follow-up work, not silently assumed already
+        covered.
+
+        Raises TypeError if `embedding_client` is not an
+        EmbeddingClient. Raises ValueError for the same invalid-input
+        cases `search()` itself already raises for (empty `query`,
+        non-positive `limit`) -- deliberately consistent with that
+        method's own validation rather than inventing a second
+        vocabulary for the same mistakes.
+        """
+
+        if not isinstance(embedding_client, EmbeddingClient):
+            raise TypeError(
+                "embedding_client must be an EmbeddingClient."
+            )
+
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query must be a non-empty string.")
+
+        if not isinstance(limit, int) or limit <= 0:
+            raise ValueError("limit must be a positive integer.")
+
+        if isinstance(min_similarity, bool) or not isinstance(
+            min_similarity, (int, float)
+        ):
+            raise TypeError("min_similarity must be a number.")
+
+        candidates = [
+            record
+            for record in reversed(self._read_all())
+            if (subject is None or record.subject == subject)
+            and (not verified_only or record.verified)
+        ]
+
+        if not candidates:
+            return ()
+
+        (query_vector,) = embedding_client.embed(
+            (query,),
+            input_type="query",
+        )
+
+        document_vectors = embedding_client.embed(
+            tuple(record.content for record in candidates),
+            input_type="document",
+        )
+
+        scored = [
+            (cosine_similarity(query_vector, vector), record)
+            for vector, record in zip(document_vectors, candidates)
+            if cosine_similarity(query_vector, vector) >= min_similarity
+        ]
+
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+
+        return tuple(record for _, record in scored[:limit])
 
     # -- internals -------------------------------------------------
 

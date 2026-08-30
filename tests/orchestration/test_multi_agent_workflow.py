@@ -44,9 +44,14 @@ from core.agents.agent_action import AgentAction, AgentActionType
 from core.agents.agent_core import AgentCore, AgentIdentity
 from core.agents.agent_loop import AgentLoopResult
 from core.agents.decision_engine import AgentDecisionEngine
+from core.agents.llm_decision_engine import LLMDecisionEngine
 from core.agents.tool_interface import AgentToolInterface
 
 from core.llm.budget import TokenBudget
+from core.llm.llm_client import LLMClient
+from core.llm.llm_request import LLMRequest
+from core.llm.llm_response import LLMResponse
+from core.llm.model_tier import ModelTierRouter
 from core.llm.token_usage import TokenUsage
 
 from core.orchestration.multi_agent_workflow import (
@@ -135,6 +140,35 @@ class _ImmediateCompleteWithUsageEngine(AgentDecisionEngine):
         return AgentAction(
             action_type=AgentActionType.COMPLETE,
             reason="Stage work done.",
+        )
+
+
+class _RecordingLLMClient(LLMClient):
+    """
+    Build Phase 27: a minimal, real LLMClient that records the last
+    LLMRequest it was asked to `generate()` -- specifically its own
+    `.model` field -- so a test can confirm which model tier
+    WorkflowStage.model_tier_router actually routed a given stage's
+    task to. Mirrors tests/agents/test_llm_decision_engine.py's own
+    MockLLMClient exactly (kept as a separate, local class here rather
+    than imported, matching this test file's own existing convention
+    of self-contained local test doubles, e.g. _ImmediateCompleteEngine
+    above).
+    """
+
+    def __init__(self) -> None:
+        self.last_request: LLMRequest | None = None
+
+    def generate(self, request: LLMRequest) -> LLMResponse:
+        self.last_request = request
+        return LLMResponse(
+            content=(
+                '{"action_type":"COMPLETE","tool_id":null,'
+                '"inputs":null,"reason":"Stage work done."}'
+            ),
+            model=request.model or "unspecified",
+            finish_reason="stop",
+            usage=None,
         )
 
 
@@ -275,6 +309,32 @@ def test_workflow_stage_accepts_a_valid_token_budget(tmp_dir):
     assert stage.token_budget is budget
 
 
+def test_workflow_stage_rejects_non_model_tier_router(tmp_dir):
+    with pytest.raises(TypeError, match="model_tier_router"):
+        WorkflowStage(
+            name="research",
+            build_agent=lambda: _build_zero_tool_agent(tmp_dir, "a"),
+            build_decision_engine=_ImmediateCompleteEngine,
+            model_tier_router="not-a-model-tier-router",
+        )
+
+
+def test_workflow_stage_accepts_a_valid_model_tier_router(tmp_dir):
+    router = ModelTierRouter(
+        simple_model="cheap-model",
+        complex_model="expensive-model",
+    )
+
+    stage = WorkflowStage(
+        name="research",
+        build_agent=lambda: _build_zero_tool_agent(tmp_dir, "a"),
+        build_decision_engine=_ImmediateCompleteEngine,
+        model_tier_router=router,
+    )
+
+    assert stage.model_tier_router is router
+
+
 def test_engine_rejects_non_sequence_stages():
     with pytest.raises(TypeError):
         MultiAgentWorkflowEngine("not-a-sequence-of-stages")
@@ -367,6 +427,95 @@ def test_workflow_runs_two_stages_and_passes_context_between_them(tmp_dir):
     assert result.status == "COMPLETED"
     assert len(result.stage_results) == 2
     assert all(r.status == "COMPLETED" for r in result.stage_results)
+
+
+def test_workflow_routes_a_simple_stage_task_to_the_simple_model(tmp_dir):
+    # Build Phase 27: WorkflowStage.model_tier_router is applied inside
+    # _make_stage_node's own node, right after this stage's decision
+    # engine is built -- a real LLMDecisionEngine's own `.model` is
+    # overwritten with the router's decision for this stage's own
+    # resolved task text, before that engine's first (and, for a
+    # COMPLETE-only stage, only) `decide()` call ever fires.
+    pytest.importorskip("langgraph")
+
+    client = _RecordingLLMClient()
+
+    router = ModelTierRouter(
+        simple_model="cheap-model",
+        complex_model="expensive-model",
+    )
+
+    stage = WorkflowStage(
+        name="research",
+        build_agent=lambda: _build_zero_tool_agent(tmp_dir, "research"),
+        build_decision_engine=lambda: LLMDecisionEngine(
+            client, model="default-model"
+        ),
+        model_tier_router=router,
+    )
+
+    engine = MultiAgentWorkflowEngine([stage])
+
+    result = engine.run(task="Search AI.", thread_id="thread-tier-simple")
+
+    assert result.status == "COMPLETED"
+    assert client.last_request is not None
+    assert client.last_request.model == "cheap-model"
+
+
+def test_workflow_routes_a_complex_stage_task_to_the_complex_model(tmp_dir):
+    pytest.importorskip("langgraph")
+
+    client = _RecordingLLMClient()
+
+    router = ModelTierRouter(
+        simple_model="cheap-model",
+        complex_model="expensive-model",
+    )
+
+    stage = WorkflowStage(
+        name="research",
+        build_agent=lambda: _build_zero_tool_agent(tmp_dir, "research"),
+        build_decision_engine=lambda: LLMDecisionEngine(
+            client, model="default-model"
+        ),
+        model_tier_router=router,
+    )
+
+    engine = MultiAgentWorkflowEngine([stage])
+
+    result = engine.run(
+        task="Please provide a comprehensive analysis of AI agents.",
+        thread_id="thread-tier-complex",
+    )
+
+    assert result.status == "COMPLETED"
+    assert client.last_request is not None
+    assert client.last_request.model == "expensive-model"
+
+
+def test_workflow_stage_without_a_model_tier_router_leaves_the_model_unchanged(
+    tmp_dir,
+):
+    pytest.importorskip("langgraph")
+
+    client = _RecordingLLMClient()
+
+    stage = WorkflowStage(
+        name="research",
+        build_agent=lambda: _build_zero_tool_agent(tmp_dir, "research"),
+        build_decision_engine=lambda: LLMDecisionEngine(
+            client, model="default-model"
+        ),
+    )
+
+    engine = MultiAgentWorkflowEngine([stage])
+
+    result = engine.run(task="Search AI.", thread_id="thread-tier-none")
+
+    assert result.status == "COMPLETED"
+    assert client.last_request is not None
+    assert client.last_request.model == "default-model"
 
 
 def test_workflow_halts_when_a_stage_fails_and_never_runs_later_stages(tmp_dir):

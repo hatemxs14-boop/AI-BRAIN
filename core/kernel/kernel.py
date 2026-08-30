@@ -25,8 +25,20 @@ from core.agents.guardrails import (
     OutputGuardrailEngine,
 )
 
+from core.agents.llm_decision_engine import (
+    LLMDecisionEngine,
+)
+
 from core.llm.budget import (
     TokenBudget,
+)
+
+from core.llm.embeddings import (
+    EmbeddingClient,
+)
+
+from core.llm.model_tier import (
+    ModelTierRouter,
 )
 
 from core.llm.token_usage import (
@@ -904,6 +916,67 @@ class Kernel:
     for why, unlike `guardrail_engine`, a configured `token_budget`
     always enforces (there is no separate "observe only" mode for it).
 
+    `model_tier_router` (Build Phase 27) is an optional
+    core.llm.model_tier.ModelTierRouter this Kernel applies for the
+    PRIMARY task-executing agent, in `_plan()` (a fresh `run()`/
+    `run_workflow()` attempt) and in `resume()`: right after a fresh
+    decision engine is built for this task, if that decision engine is
+    an LLMDecisionEngine, its own `.model` is overwritten with whichever
+    model this router's `route(normalized.text)` call names -- routing
+    a simple-looking task to a cheaper model and a complex-looking one
+    to the full configured model. See core/llm/model_tier.py's own
+    module docstring for the full heuristic and for why this only ever
+    touches LLMDecisionEngine (any other decision engine, including
+    every test double in this suite, is left completely untouched).
+    Defaults to `None`, in which case no decision engine's `.model` is
+    ever touched by this Kernel and behavior is completely unchanged
+    from before this phase -- the same opt-in, additive shape every
+    optional Kernel component above already established. Deliberately
+    NOT surfaced as a new KernelResult field in this v1 -- see that
+    module's own docstring for why this keeps exactly the same scope
+    the base `model`/`temperature`/`max_tokens` already had (never
+    inspectable Kernel-result data either).
+
+    `semantic_embedding_client` (Build Phase 28) is an optional
+    core.llm.embeddings.EmbeddingClient this Kernel may use during
+    CONTEXT RETRIEVAL (_retrieve_context) instead of `memory_store`'s
+    plain keyword `search()`. When configured AND `memory_store` is
+    also configured, `_retrieve_context` first attempts
+    `self.memory_store.search_semantic(normalized.text,
+    embedding_client=self.semantic_embedding_client,
+    limit=self.context_retrieval_limit)`. Two distinct failure paths
+    are handled differently, deliberately:
+
+      - `search_semantic()` raises `ValueError` (e.g. an empty query)
+        -- degrades to `None`, the exact same tolerance
+        `_retrieve_context` already established for a plain
+        `search()` call raising `ValueError` (see this method's own
+        "no memory_store configured" docstring paragraph below).
+      - `search_semantic()` raises any OTHER `Exception` (a real
+        embeddings-API failure -- a network error, a missing/invalid
+        API key surfacing as an EmbeddingConfigError, and so on) --
+        falls through to the plain keyword `self.memory_store.
+        search(...)` call instead of giving up entirely. This is
+        deliberately MORE resilient than the bare degrade-to-`None`
+        the `ValueError` path above uses: a working, zero-marginal-
+        cost fallback is already sitting right there, so silently
+        losing all retrieved context over a transient embeddings-API
+        outage would be strictly worse than falling back to the
+        keyword search this Kernel already ran before this phase.
+
+    Defaults to `None`, in which case `_retrieve_context` behaves
+    exactly as it did before this phase (plain keyword `search()`
+    only) -- the same opt-in, additive shape every optional Kernel
+    component above already established. Meaningless when
+    `memory_store` is not also configured (there is nothing to search,
+    semantically or otherwise). Deliberately narrow, honestly-scoped
+    v1: this only ever touches `_retrieve_context`'s own memory-record
+    retrieval -- CLASSIFY's own agent-routing keyword vocabularies
+    (core/kernel/default_kernel.py) and the `topic_drift` guardrail
+    check (core/agents/guardrails.py) are NOT wired to embeddings in
+    this phase; see core/llm/embeddings.py's own module docstring for
+    the full rationale.
+
     `run_multi_agent_workflow`/`resume_multi_agent_workflow` (Build
     Phase 25) chain already-registered agents into a real, compiled
     LangGraph graph (core.orchestration.multi_agent_workflow's
@@ -928,6 +1001,8 @@ class Kernel:
         context_retrieval_limit: int = 5,
         guardrail_engine: OutputGuardrailEngine | None = None,
         token_budget: TokenBudget | None = None,
+        model_tier_router: ModelTierRouter | None = None,
+        semantic_embedding_client: EmbeddingClient | None = None,
     ) -> None:
 
         if not isinstance(max_recovery_attempts, int):
@@ -1014,6 +1089,25 @@ class Kernel:
             )
 
         self.token_budget = token_budget
+
+        if model_tier_router is not None and not isinstance(
+            model_tier_router, ModelTierRouter
+        ):
+            raise TypeError(
+                "model_tier_router must be a ModelTierRouter or None."
+            )
+
+        self.model_tier_router = model_tier_router
+
+        if semantic_embedding_client is not None and not isinstance(
+            semantic_embedding_client, EmbeddingClient
+        ):
+            raise TypeError(
+                "semantic_embedding_client must be an EmbeddingClient "
+                "or None."
+            )
+
+        self.semantic_embedding_client = semantic_embedding_client
 
     def register_agent(
         self,
@@ -1305,6 +1399,8 @@ class Kernel:
 
         decision_engine = registration.build_decision_engine()
 
+        self._apply_model_tier_routing(decision_engine, normalized)
+
         agent.start_task(normalized.text)
 
         loop = AgentExecutionLoop(
@@ -1595,9 +1691,10 @@ class Kernel:
         from this mapping (or the mapping itself omitted) never pauses.
 
         Every stage built here is threaded with this Kernel's own
-        `self.guardrail_engine` (Build Phase 23) and `self.token_budget`
-        (Build Phase 26), exactly mirroring how `_execute_once` threads
-        both into a single agent's own AgentExecutionLoop -- `None`
+        `self.guardrail_engine` (Build Phase 23), `self.token_budget`
+        (Build Phase 26), and `self.model_tier_router` (Build Phase 27),
+        exactly mirroring how `_plan()`/`_apply_model_tier_routing`
+        thread all three into a single agent's own execution -- `None`
         unless this Kernel was itself constructed with one.
 
         Deliberately narrower than Kernel.run(): no NORMALIZE/CLASSIFY/
@@ -1736,6 +1833,7 @@ class Kernel:
                     ),
                     guardrail_engine=self.guardrail_engine,
                     token_budget=self.token_budget,
+                    model_tier_router=self.model_tier_router,
                 )
             )
 
@@ -1894,14 +1992,43 @@ class Kernel:
             default -- see Kernel.__init__'s own docstring for why an
             unconfigured Kernel must behave exactly as it did before
             Build Phase 14)
-          - MemoryStore.search() itself raises (e.g. ValueError for an
-            empty query -- not reachable through _normalize's own
-            non-empty guarantee today, but this method does not rely
-            on that guarantee holding forever)
+          - the search ultimately used (semantic or keyword -- see
+            below) raises `ValueError` (e.g. an empty query -- not
+            reachable through _normalize's own non-empty guarantee
+            today, but this method does not rely on that guarantee
+            holding forever)
+
+        Build Phase 28: when `self.semantic_embedding_client` is also
+        configured, this method tries a real semantic search
+        (`self.memory_store.search_semantic(...)`) FIRST. See
+        Kernel.__init__'s own `semantic_embedding_client` docstring
+        paragraph for exactly how each of that call's two distinct
+        failure modes (`ValueError` vs. any other `Exception`) is
+        handled -- summarized here: `ValueError` degrades to `None`
+        just like the plain-keyword path below; any other `Exception`
+        (a real embeddings-API failure) falls through to the plain
+        keyword `search()` call below instead, rather than losing all
+        retrieved context over what may be a transient outage.
         """
 
         if self.memory_store is None:
             return None
+
+        if self.semantic_embedding_client is not None:
+            try:
+                records = self.memory_store.search_semantic(
+                    normalized.text,
+                    embedding_client=self.semantic_embedding_client,
+                    limit=self.context_retrieval_limit,
+                )
+            except ValueError:
+                return None
+            except Exception:
+                pass
+            else:
+                return RetrievedContext(
+                    query=normalized.text, records=records
+                )
 
         try:
             records = self.memory_store.search(
@@ -1996,12 +2123,46 @@ class Kernel:
 
         decision_engine = registration.build_decision_engine()
 
+        self._apply_model_tier_routing(decision_engine, normalized)
+
         return KernelPlan(
             subject=registration.subject,
             agent=agent,
             decision_engine=decision_engine,
             max_steps=max_steps,
         )
+
+    def _apply_model_tier_routing(
+        self,
+        decision_engine: AgentDecisionEngine,
+        normalized: NormalizedTask,
+    ) -> None:
+        """
+        Build Phase 27: when this Kernel is configured with a
+        `model_tier_router`, and `decision_engine` is an
+        LLMDecisionEngine, overwrite its `.model` with whichever model
+        `self.model_tier_router.route(normalized.text)` names for this
+        task -- see core/llm/model_tier.py's own module docstring for
+        the full design and Kernel.__init__'s own docstring (the
+        `model_tier_router` paragraph) for exactly what this does and
+        does not cover.
+
+        A no-op whenever `self.model_tier_router` is `None` (the
+        default) or `decision_engine` is not an LLMDecisionEngine
+        (e.g. DeterministicDecisionEngine, or any test double) --
+        never an error either way, the same tolerant, purely additive
+        shape `guardrail_engine`/`token_budget` already established.
+        """
+
+        if self.model_tier_router is None:
+            return
+
+        if not isinstance(decision_engine, LLMDecisionEngine):
+            return
+
+        decision = self.model_tier_router.route(normalized.text)
+
+        decision_engine.model = decision.model
 
     def _should_recover(
         self,

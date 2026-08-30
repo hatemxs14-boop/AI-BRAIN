@@ -14,7 +14,11 @@ from core.agents.decision_engine import AgentDecisionEngine
 
 from core.agents.guardrails import OutputGuardrailEngine
 
+from core.agents.llm_decision_engine import LLMDecisionEngine
+
 from core.llm.budget import TokenBudget
+
+from core.llm.model_tier import ModelTierRouter
 
 
 # ---------------------------------------------------------------------
@@ -92,9 +96,14 @@ from core.llm.budget import TokenBudget
 # guardrail_engine into a single agent's own AgentExecutionLoop.
 # Build Phase 26 threads the Kernel's own `token_budget` the same way,
 # via WorkflowStage.token_budget -- same mirroring, same call site.
+# Build Phase 27 threads the Kernel's own `model_tier_router` the same
+# way again, via WorkflowStage.model_tier_router -- applied in
+# _make_stage_node() right after a fresh decision engine is built,
+# against this stage's own resolved task text.
 # Kernel still does NOT thread checkpoint_store into a multi-agent
 # workflow's own stages -- a deliberately narrower scope boundary than
-# even guardrail_engine's/token_budget's, left for a future phase.
+# even guardrail_engine's/token_budget's/model_tier_router's, left for
+# a future phase.
 # ---------------------------------------------------------------------
 
 
@@ -190,6 +199,23 @@ class WorkflowStage:
     total across every stage that has already run.
     """
 
+    model_tier_router: ModelTierRouter | None = None
+    """
+    Optional, per-stage (Build Phase 27; Kernel.run_multi_agent_
+    workflow() passes the Kernel's own `self.model_tier_router` here
+    for every stage it builds, exactly mirroring how it already passes
+    `self.guardrail_engine`/`self.token_budget` above). `None` by
+    default: a stage built directly (not through the Kernel) has no
+    model-tier routing unless explicitly given one, the same opt-in
+    convention every other optional component in this project follows.
+    Applied in `_make_stage_node()`'s own node, right after this
+    stage's `build_decision_engine()` is called, against this stage's
+    own resolved task text (`stage.task_template(...)`'s own output) --
+    see core/llm/model_tier.py's own module docstring for the full
+    heuristic and Kernel.__init__'s `model_tier_router` paragraph for
+    why this only ever touches an LLMDecisionEngine.
+    """
+
     def __post_init__(self) -> None:
 
         if not isinstance(self.name, str) or not self.name.strip():
@@ -244,6 +270,14 @@ class WorkflowStage:
             raise TypeError(
                 "WorkflowStage.token_budget must be a TokenBudget "
                 "or None."
+            )
+
+        if self.model_tier_router is not None and not isinstance(
+            self.model_tier_router, ModelTierRouter
+        ):
+            raise TypeError(
+                "WorkflowStage.model_tier_router must be a "
+                "ModelTierRouter or None."
             )
 
 
@@ -302,6 +336,12 @@ def _make_stage_node(stage: WorkflowStage):
         agent.start_task(task_text)
 
         decision_engine = stage.build_decision_engine()
+
+        if stage.model_tier_router is not None and isinstance(
+            decision_engine, LLMDecisionEngine
+        ):
+            tier_decision = stage.model_tier_router.route(task_text)
+            decision_engine.model = tier_decision.model
 
         loop = AgentExecutionLoop(
             agent=agent,

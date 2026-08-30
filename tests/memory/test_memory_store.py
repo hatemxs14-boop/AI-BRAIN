@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from core.llm.embeddings import EmbeddingClient
 from core.memory.memory_store import MemoryEntry, MemoryRecord, MemoryStore
 
 
@@ -433,5 +434,318 @@ def test_concurrent_writes_from_separate_store_instances_never_corrupt_the_file(
         assert len({record.id for record in all_records}) == (
             thread_count * writes_per_thread
         )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------
+# search_semantic() (Build Phase 28)
+#
+# Uses a fake, in-process EmbeddingClient double keyed by exact text ->
+# vector, never a real network call -- exactly the same convention
+# tests/llm/test_embeddings.py's own _FakeVoyageVendorClient
+# establishes one layer down. Vectors are deliberately simple 2D unit-
+# ish vectors chosen so cosine similarity works out to an exact,
+# easy-to-assert value (1.0 for identical direction, 0.0 for
+# orthogonal, -1.0 for opposite).
+# ---------------------------------------------------------------------
+
+
+class _FakeEmbeddingClient(EmbeddingClient):
+    def __init__(self, vectors: dict) -> None:
+        self._vectors = vectors
+        self.calls: list = []
+
+    def embed(self, texts, *, input_type):
+        texts = tuple(texts)
+        self.calls.append({"texts": texts, "input_type": input_type})
+        return tuple(self._vectors[text] for text in texts)
+
+
+def test_search_semantic_rejects_non_embedding_client():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        store = _store(tmp_dir)
+        with pytest.raises(TypeError, match="EmbeddingClient"):
+            store.search_semantic("query", embedding_client="not-a-client")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_search_semantic_rejects_empty_query():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        store = _store(tmp_dir)
+        client = _FakeEmbeddingClient({})
+        with pytest.raises(ValueError, match="query"):
+            store.search_semantic("   ", embedding_client=client)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_search_semantic_rejects_non_positive_limit():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        store = _store(tmp_dir)
+        client = _FakeEmbeddingClient({})
+        with pytest.raises(ValueError, match="limit"):
+            store.search_semantic("query", embedding_client=client, limit=0)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_search_semantic_rejects_non_numeric_min_similarity():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        store = _store(tmp_dir)
+        client = _FakeEmbeddingClient({})
+        with pytest.raises(TypeError, match="min_similarity"):
+            store.search_semantic(
+                "query", embedding_client=client, min_similarity="high"
+            )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_search_semantic_rejects_bool_min_similarity():
+    # bool is a subclass of int -- must be rejected explicitly, the
+    # same convention this project applies to every numeric field.
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        store = _store(tmp_dir)
+        client = _FakeEmbeddingClient({})
+        with pytest.raises(TypeError, match="min_similarity"):
+            store.search_semantic(
+                "query", embedding_client=client, min_similarity=True
+            )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_search_semantic_on_empty_store_never_calls_embed():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        store = _store(tmp_dir)
+        client = _FakeEmbeddingClient({})
+
+        results = store.search_semantic("query", embedding_client=client)
+
+        assert results == ()
+        assert client.calls == []
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_search_semantic_never_calls_embed_when_subject_filter_empties_the_pool():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        store = _store(tmp_dir)
+        store.write(
+            MemoryEntry(subject="research_agent", kind="note", content="apple")
+        )
+        client = _FakeEmbeddingClient({})
+
+        results = store.search_semantic(
+            "query", embedding_client=client, subject="writer_agent"
+        )
+
+        assert results == ()
+        assert client.calls == []
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_search_semantic_filters_by_subject_before_embedding():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        store = _store(tmp_dir)
+        store.write(
+            MemoryEntry(subject="research_agent", kind="note", content="apple")
+        )
+        store.write(
+            MemoryEntry(subject="writer_agent", kind="note", content="banana")
+        )
+        client = _FakeEmbeddingClient(
+            {"query": (1.0, 0.0), "banana": (1.0, 0.0)}
+        )
+
+        results = store.search_semantic(
+            "query", embedding_client=client, subject="writer_agent"
+        )
+
+        assert len(results) == 1
+        assert results[0].content == "banana"
+        # Only the surviving candidate's content was ever embedded.
+        document_call = next(
+            call for call in client.calls if call["input_type"] == "document"
+        )
+        assert document_call["texts"] == ("banana",)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_search_semantic_verified_only_excludes_unverified_records():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        store = _store(tmp_dir)
+        record = store.write(
+            MemoryEntry(subject="research_agent", kind="finding", content="apple")
+        )
+        client = _FakeEmbeddingClient({"query": (1.0, 0.0), "apple": (1.0, 0.0)})
+
+        assert (
+            store.search_semantic(
+                "query", embedding_client=client, verified_only=True
+            )
+            == ()
+        )
+        assert client.calls == []
+
+        store.verify(record.id, verified_by="reviewer_agent")
+
+        verified_results = store.search_semantic(
+            "query", embedding_client=client, verified_only=True
+        )
+        assert len(verified_results) == 1
+        assert verified_results[0].verified is True
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_search_semantic_ranks_by_descending_cosine_similarity():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        store = _store(tmp_dir)
+        store.write(
+            MemoryEntry(subject="research_agent", kind="note", content="carrot")
+        )
+        store.write(
+            MemoryEntry(subject="research_agent", kind="note", content="banana")
+        )
+        store.write(
+            MemoryEntry(subject="research_agent", kind="note", content="apple")
+        )
+
+        client = _FakeEmbeddingClient(
+            {
+                "query": (1.0, 0.0),
+                "apple": (1.0, 0.0),  # cosine similarity 1.0
+                "banana": (0.0, 1.0),  # cosine similarity 0.0
+                "carrot": (-1.0, 0.0),  # cosine similarity -1.0
+            }
+        )
+
+        # min_similarity=-1.0 so carrot's -1.0 similarity (below the
+        # method's own default 0.0 threshold) is still included --
+        # this test is about ranking order, not the threshold itself
+        # (see test_search_semantic_respects_min_similarity_threshold
+        # for that).
+        results = store.search_semantic(
+            "query", embedding_client=client, min_similarity=-1.0
+        )
+
+        assert [record.content for record in results] == [
+            "apple",
+            "banana",
+            "carrot",
+        ]
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_search_semantic_respects_limit():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        store = _store(tmp_dir)
+        store.write(
+            MemoryEntry(subject="research_agent", kind="note", content="carrot")
+        )
+        store.write(
+            MemoryEntry(subject="research_agent", kind="note", content="banana")
+        )
+        store.write(
+            MemoryEntry(subject="research_agent", kind="note", content="apple")
+        )
+
+        client = _FakeEmbeddingClient(
+            {
+                "query": (1.0, 0.0),
+                "apple": (1.0, 0.0),
+                "banana": (0.0, 1.0),
+                "carrot": (-1.0, 0.0),
+            }
+        )
+
+        results = store.search_semantic("query", embedding_client=client, limit=1)
+
+        assert [record.content for record in results] == ["apple"]
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_search_semantic_respects_min_similarity_threshold():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        store = _store(tmp_dir)
+        store.write(
+            MemoryEntry(subject="research_agent", kind="note", content="banana")
+        )
+        store.write(
+            MemoryEntry(subject="research_agent", kind="note", content="apple")
+        )
+
+        client = _FakeEmbeddingClient(
+            {
+                "query": (1.0, 0.0),
+                "apple": (1.0, 0.0),  # similarity 1.0
+                "banana": (0.0, 1.0),  # similarity 0.0
+            }
+        )
+
+        results = store.search_semantic(
+            "query", embedding_client=client, min_similarity=0.5
+        )
+
+        assert [record.content for record in results] == ["apple"]
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_search_semantic_embeds_query_and_documents_with_correct_input_types():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        store = _store(tmp_dir)
+        store.write(
+            MemoryEntry(subject="research_agent", kind="note", content="apple")
+        )
+        client = _FakeEmbeddingClient({"query": (1.0, 0.0), "apple": (1.0, 0.0)})
+
+        store.search_semantic("query", embedding_client=client)
+
+        input_types = [call["input_type"] for call in client.calls]
+        assert input_types == ["query", "document"]
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_search_semantic_makes_exactly_two_embed_calls_regardless_of_pool_size():
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        store = _store(tmp_dir)
+        vectors = {"query": (1.0, 0.0)}
+        for i in range(10):
+            content = f"item-{i}"
+            store.write(
+                MemoryEntry(
+                    subject="research_agent", kind="note", content=content
+                )
+            )
+            vectors[content] = (1.0, 0.0)
+
+        client = _FakeEmbeddingClient(vectors)
+
+        store.search_semantic("query", embedding_client=client, limit=3)
+
+        assert len(client.calls) == 2
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
